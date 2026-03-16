@@ -1,8 +1,8 @@
 // @name 123TV
 // @author 
-// @description 刮削：支持，弹幕：支持，嗅探：支持
+// @description 刮削：支持，弹幕：支持，嗅探：支持，广告：菠菜
 // @dependencies: axios
-// @version 1.0.2
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/123TV.js
 
 /**
@@ -61,11 +61,20 @@ const decodeMeta = (str) => {
 };
 
 const buildScrapedEpisodeName = (scrapeData, mapping, originalName) => {
-    if (!scrapeData || !mapping || !originalName) return originalName;
-    const hit = mapping[originalName];
-    if (!hit) return originalName;
-    if (typeof hit === 'string') return hit;
-    if (hit.title) return hit.title;
+    if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+        return originalName;
+    }
+    if (mapping.episodeName) {
+        return mapping.episodeName;
+    }
+    if (scrapeData && Array.isArray(scrapeData.episodes)) {
+        const hit = scrapeData.episodes.find(
+            (ep) => ep.episodeNumber === mapping.episodeNumber && ep.seasonNumber === mapping.seasonNumber
+        );
+        if (hit?.name) {
+            return `${hit.episodeNumber}.${hit.name}`;
+        }
+    }
     return originalName;
 };
 
@@ -261,15 +270,18 @@ const parsePlaySources = (fromStr, urlStr, videoId = '', vodName = '') => {
             const parts = item.split('$');
             const episodeName = parts[0] || '正片';
             const rawPlayId = parts[1] || parts[0];
+            const fid = `${videoId}#${i}#${episodeIndex}`;
             const playMeta = {
                 sid: videoId,
-                fid: episodeName,
+                fid,
                 v: vodName,
                 e: episodeIndex + 1
             };
             return {
                 name: episodeName,
-                playId: `${rawPlayId}|||${encodeMeta(playMeta)}`
+                playId: `${rawPlayId}|||${encodeMeta(playMeta)}`,
+                _fid: fid,
+                _rawName: episodeName
             };
         }).filter(e => e.playId);
 
@@ -282,6 +294,12 @@ const parsePlaySources = (fromStr, urlStr, videoId = '', vodName = '') => {
     }
     logInfo("播放源解析结果", playSources);
     return playSources;
+};
+
+const buildPosterUrl = (path) => {
+    if (!path) return '';
+    if (path.startsWith('http')) return path;
+    return `https://image.tmdb.org/t/p/w500${path}`;
 };
 
 /**
@@ -558,10 +576,14 @@ async function detail(params, context) {
                 const scrapeCandidates = [];
                 for (const source of vod.vod_play_sources || []) {
                     for (const episode of source.episodes || []) {
-                        if (!episode || !episode.name) continue;
+                        if (!episode || !episode._fid) continue;
+                        const name = episode._rawName || episode.name || '正片';
                         scrapeCandidates.push({
-                            fileName: episode.name,
-                            fileId: episode.playId
+                            fid: episode._fid,
+                            file_id: episode._fid,
+                            file_name: name,
+                            name,
+                            format_type: 'video'
                         });
                     }
                 }
@@ -577,32 +599,51 @@ async function detail(params, context) {
                     logInfo(`刮削处理完成,结果: ${JSON.stringify(scrapingResult).substring(0, 200)}`);
 
                     const metadata = await OmniBox.getScrapeMetadata(sourceId);
-                    const scrapeData = metadata && metadata.data;
+                    const scrapeData = metadata?.scrapeData || null;
+                    const videoMappings = metadata?.videoMappings || [];
 
                     if (scrapeData) {
-                        vod.vod_name = scrapeData.name || vod.vod_name;
-                        vod.vod_pic = scrapeData.poster_path || vod.vod_pic;
-                        vod.vod_year = scrapeData.release_date || vod.vod_year;
+                        vod.vod_name = scrapeData.title || scrapeData.name || vod.vod_name;
+                        const poster = scrapeData.posterPath || scrapeData.poster_path || scrapeData.poster || '';
+                        vod.vod_pic = poster ? buildPosterUrl(poster) : vod.vod_pic;
+                        const releaseDate = scrapeData.releaseDate || scrapeData.release_date || '';
+                        vod.vod_year = releaseDate ? String(releaseDate).substring(0, 4) : vod.vod_year;
                         vod.vod_content = scrapeData.overview || vod.vod_content;
                         vod.vod_actor = scrapeData.actors || vod.vod_actor;
                         vod.vod_director = scrapeData.director || vod.vod_director;
 
-                        const mappings = scrapeData.mappings || {};
+                        if (scrapeData.credits?.cast) {
+                            const actors = scrapeData.credits.cast
+                                .slice(0, 5)
+                                .map((c) => c?.name)
+                                .filter(Boolean)
+                                .join(',');
+                            if (actors) vod.vod_actor = actors;
+                        }
+                        if (scrapeData.credits?.crew) {
+                            const directors = scrapeData.credits.crew
+                                .filter((c) => c?.job === 'Director' || c?.department === 'Directing')
+                                .slice(0, 3)
+                                .map((c) => c?.name)
+                                .filter(Boolean)
+                                .join(',');
+                            if (directors) vod.vod_director = directors;
+                        }
+
                         vod.vod_play_sources = (vod.vod_play_sources || []).map((source) => {
                             const episodes = (source.episodes || []).map((ep) => {
+                                const mapping = videoMappings.find((m) => m?.fileId === ep._fid);
+                                if (!mapping) return ep;
                                 const oldName = ep.name || '';
-                                const newName = buildScrapedEpisodeName(scrapeData, mappings, oldName);
+                                const newName = buildScrapedEpisodeName(scrapeData, mapping, oldName);
                                 if (oldName !== newName) {
                                     logInfo(`应用刮削后源文件名: ${oldName} -> ${newName}`);
                                 }
-                                const mapInfo = mappings[oldName] || {};
-                                const sortSeason = parseInt(mapInfo.seasonNumber, 10) || 0;
-                                const sortEpisode = parseInt(mapInfo.episodeNumber, 10) || 0;
                                 return {
                                     ...ep,
                                     name: newName,
-                                    _sortSeason: sortSeason,
-                                    _sortEpisode: sortEpisode
+                                    _sortSeason: mapping.seasonNumber || 0,
+                                    _sortEpisode: mapping.episodeNumber || 0
                                 };
                             }).sort((a, b) => {
                                 if ((a._sortSeason || 0) !== (b._sortSeason || 0)) {
@@ -671,6 +712,9 @@ async function play(params, context) {
                 );
                 if (metadata.scrapeData.title) {
                     vodName = metadata.scrapeData.title;
+                }
+                if (mapping?.episodeName) {
+                    episodeName = mapping.episodeName;
                 }
             }
         }
