@@ -2,7 +2,7 @@
 // @author 梦
 // @description 刮削：未接入，弹幕：站内弹幕接口，嗅探：不需要
 // @dependencies
-// @version 1.0.1
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/乌云影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -193,12 +193,13 @@ function buildClasses(menu) {
   const thisYear = yearChildren.find((item) => item?.code === "THIS_YEAR");
 
   const rootMenus = extractRootMenus(menu);
-  const preferredCodes = ["movie", "tv_series", "animation", "variety"];
+  const preferredCodes = ["movie", "tv_series", "animation", "variety", "short_drama"];
   const fallbackNames = {
     movie: "电影",
     tv_series: "电视剧",
     animation: "动画",
     variety: "综艺",
+    short_drama: "短剧",
   };
 
   const classes = preferredCodes.map((code) => {
@@ -245,7 +246,7 @@ function buildFilterArrayForClass(categoryId, optionMap) {
     });
   }
 
-  if (optionMap.genre.length && ["movie", "tv_series", "animation", "variety"].includes(categoryId)) {
+  if (optionMap.genre.length && ["movie", "tv_series", "animation", "variety", "short_drama"].includes(categoryId)) {
     list.push({
       key: "genre",
       name: "类型",
@@ -313,7 +314,7 @@ function buildCategoryBody(categoryId, page, filters) {
   };
 
   const menuCodeList = [];
-  if (!["movie", "tv_series", "animation", "variety"].includes(categoryId)) {
+  if (!["movie", "tv_series", "animation", "variety", "short_drama"].includes(categoryId)) {
     menuCodeList.push(categoryId);
   }
 
@@ -347,6 +348,7 @@ function mapTopCode(categoryId) {
     tv_series: "tv_series",
     animation: "animation",
     variety: "variety",
+    short_drama: "short_drama",
     THIS_YEAR: "movie",
     LAST_YEAR: "movie",
   };
