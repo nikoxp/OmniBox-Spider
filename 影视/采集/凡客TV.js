@@ -1,8 +1,8 @@
 // @name 凡客TV
 // @author 梦
-// @description 刮削：已接入，弹幕：未接入，嗅探：按官方 POST 播放接口直链优先（失败时页面回退）
+// @description 刮削：已接入，弹幕：未接入，嗅探：按官方 POST 播放接口直链优先（失败时页面回退）；已补首页推荐与关键词搜索
 // @dependencies cheerio
-// @version 1.2.4
+// @version 1.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/openclaw/影视/采集/凡客TV.js
 
 const OmniBox = require("omnibox_sdk");
@@ -110,6 +110,71 @@ function _extractPageState(html) {
   return state;
 }
 
+function _extractVodId(href) {
+  const match = String(href || "").match(/\/movie\/detail\/([0-9a-fA-F]+)/);
+  return match ? match[1] : "";
+}
+
+function _absUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `${BASE_URL}${value}`;
+  return `${BASE_URL}/${value}`;
+}
+
+function _collectTags($, $scope) {
+  const tags = [];
+  $scope.find(".tag").each((_, el) => {
+    const txt = $(el).text().trim();
+    if (txt) tags.push(txt);
+  });
+  return tags;
+}
+
+function _buildVodCard($, $scope, typeId = "") {
+  const titleAnchor = $scope.find("a[title*='']").filter((_, el) => _extractVodId($(el).attr("href"))).first();
+  const fallbackAnchor = $scope.find(".normal-title, .hover-title").first();
+  const anchor = titleAnchor.length ? titleAnchor : fallbackAnchor;
+  const href = anchor.attr("href") || "";
+  const vodId = _extractVodId(href);
+  if (!vodId) return null;
+
+  const vodName = anchor.attr("title") || anchor.text().trim() || $scope.find(".normal-title, .hover-title").first().text().trim();
+  if (!vodName) return null;
+
+  const vodPic = _absUrl(
+    $scope.find(".lazy-load").first().attr("data-src")
+    || $scope.find(".lazy-load").first().attr("src")
+    || $scope.find("img").first().attr("src")
+    || ""
+  );
+
+  const tags = _collectTags($, $scope);
+  const categoryText = $scope.find(".category").first().text().replace(/\s+/g, " ").trim();
+  const remarks = [...tags, categoryText].filter(Boolean).join(" | ");
+
+  return {
+    vod_id: vodId,
+    vod_name: vodName,
+    vod_pic: vodPic,
+    vod_url: `${BASE_URL}/movie/detail/${vodId}`,
+    type_id: String(typeId || ""),
+    type_name: tags[0] || "",
+    vod_remarks: remarks
+  };
+}
+
+function _dedupVodList(list) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : []).filter((it) => {
+    if (!it || !it.vod_id || seen.has(it.vod_id)) return false;
+    seen.add(it.vod_id);
+    return true;
+  });
+}
+
 function _extractLineTabs(html) {
   const lines = [];
   const re = /<div\s+data-line=["']([^"']+)["'][^>]*class=["'][^"']*item-wrap[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi;
@@ -121,6 +186,7 @@ function _extractLineTabs(html) {
   }
   return lines;
 }
+
 
 function _pickEpisodeName(item) {
   return String((item && (item.name || item.title || item.id)) || "").trim() || "正片";
@@ -267,18 +333,37 @@ async function _fetchPlayLinks(pageUrl, movieId, linkId) {
 }
 
 async function home() {
+  const res = await OmniBox.request(BASE_URL, {
+    method: "GET",
+    headers: _buildPageHeaders(BASE_URL),
+    timeout: 20000
+  });
+  const html = _getBodyText(res);
+  const $ = cheerio.load(html);
+
+  const classes = [
+    { type_id: "1", type_name: "电影" },
+    { type_id: "2", type_name: "剧集" },
+    { type_id: "4", type_name: "动漫" },
+    { type_id: "3", type_name: "综艺" },
+    { type_id: "8", type_name: "短剧" },
+    { type_id: "6", type_name: "纪录片" },
+    { type_id: "7", type_name: "解说" },
+    { type_id: "5", type_name: "音乐" }
+  ];
+
+  const list = [];
+  $(".video-wrap .item-wrap.vertical.group, .list-wrap .item-wrap.vertical.group").each((_, el) => {
+    const item = _buildVodCard($, $(el));
+    if (item) list.push(item);
+  });
+
+  const dedup = _dedupVodList(list);
+  await _log("info", "home 解析结果", { count: dedup.length, first: dedup[0] || null });
+
   return {
-    class: [
-      { type_id: "1", type_name: "电影" },
-      { type_id: "2", type_name: "剧集" },
-      { type_id: "4", type_name: "动漫" },
-      { type_id: "3", type_name: "综艺" },
-      { type_id: "8", type_name: "短剧" },
-      { type_id: "6", type_name: "纪录片" },
-      { type_id: "7", type_name: "解说" },
-      { type_id: "5", type_name: "音乐" }
-    ],
-    list: []
+    class: classes,
+    list: dedup.slice(0, 24)
   };
 }
 
@@ -296,39 +381,16 @@ async function category(params) {
   const $ = cheerio.load(html);
   const list = [];
 
-  function pushCard($scope) {
-    const a = $scope.find(".normal-title, .hover-title").first();
-    const href = a.attr("href") || "";
-    const idMatch = href.match(/\/movie\/detail\/([0-9a-fA-F]+)/);
-    if (!idMatch) return;
-    const id = idMatch[1];
-    const title = a.attr("title") || a.text().trim();
-    const pic = $scope.find(".lazy-load").attr("data-src") || "";
-    const tags = [];
-    $scope.find(".tag").each((_, el) => {
-      const txt = $(el).text().trim();
-      if (txt) tags.push(txt);
-    });
-    list.push({
-      vod_id: id,
-      vod_name: title,
-      vod_pic: pic,
-      vod_url: `${BASE_URL}/movie/detail/${id}`,
-      type_id: String(typeId),
-      type_name: tags[0] || "",
-      vod_remarks: tags.join(" | ")
-    });
-  }
-
-  $(".meta-wrap").each((_, el) => pushCard($(el).parent()));
-  if (!list.length) $(".hover-wrap").each((_, el) => pushCard($(el)));
-
-  const seen = new Set();
-  const dedup = list.filter((it) => {
-    if (seen.has(it.vod_id)) return false;
-    seen.add(it.vod_id);
-    return true;
+  $(".video-wrap .item-wrap.vertical.group, .list-wrap .item-wrap.vertical.group, .meta-wrap, .hover-wrap").each((_, el) => {
+    const $el = $(el);
+    const card = _buildVodCard($, $el.hasClass("meta-wrap") ? $el.parent() : $el);
+    if (card) {
+      card.type_id = String(typeId || "");
+      list.push(card);
+    }
   });
+
+  const dedup = _dedupVodList(list);
 
   await _log("info", "category 解析结果", { count: dedup.length, first: dedup[0] || null });
   return { ..._normalizePagination(page, pageSize, dedup.length), list: dedup };
@@ -590,45 +652,21 @@ async function search(params) {
   await _log("info", "search 入参", params);
   if (!keyword) return { ..._normalizePagination(page, pageSize, 0), list: [] };
 
-  const url = `${BASE_URL}/search?keyword=${encodeURIComponent(keyword)}`;
-  await _log("info", "search 请求地址", { url });
+  const url = `${BASE_URL}/channel?keywords=${encodeURIComponent(keyword)}&page=${page}&page_size=${pageSize}`;
+  await _log("info", "search 请求地址", { url, note: "凡客站内搜索实际跳转到 /channel?keywords=，原 /search 接口当前返回 500" });
 
   const res = await OmniBox.request(url, { method: "GET", headers: _buildPageHeaders(BASE_URL) });
   const html = _getBodyText(res);
   const $ = cheerio.load(html);
   const list = [];
 
-  $(".meta-wrap, .hover-wrap").each((_, el) => {
+  $(".video-wrap .item-wrap.vertical.group, .list-wrap .item-wrap.vertical.group, .meta-wrap, .hover-wrap").each((_, el) => {
     const $el = $(el);
-    const a = $el.find(".normal-title, .hover-title").first();
-    const href = a.attr("href") || "";
-    const m = href.match(/\/movie\/detail\/([0-9a-fA-F]+)/);
-    if (!m) return;
-    const id = m[1];
-    const title = a.attr("title") || a.text().trim();
-    const pic = $el.find(".lazy-load").attr("data-src") || "";
-    const tags = [];
-    $el.find(".tag").each((__, t) => {
-      const txt = $(t).text().trim();
-      if (txt) tags.push(txt);
-    });
-    list.push({
-      vod_id: id,
-      vod_name: title,
-      vod_pic: pic,
-      vod_url: `${BASE_URL}/movie/detail/${id}`,
-      type_id: "",
-      type_name: tags[0] || "",
-      vod_remarks: tags.join(" | ")
-    });
+    const card = _buildVodCard($, $el.hasClass("meta-wrap") ? $el.parent() : $el);
+    if (card) list.push(card);
   });
 
-  const seen = new Set();
-  const dedup = list.filter((it) => {
-    if (seen.has(it.vod_id)) return false;
-    seen.add(it.vod_id);
-    return true;
-  });
+  const dedup = _dedupVodList(list);
 
   await _log("info", "search 解析结果", { count: dedup.length, first: dedup[0] || null });
   return { ..._normalizePagination(page, pageSize, dedup.length), list: dedup };
