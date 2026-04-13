@@ -2,7 +2,7 @@
 // @author 梦
 // @description 页面解析：已接入；播放：解析页面 /api/m3u8 并跟随到最终可播 m3u8
 // @dependencies cheerio
-// @version 1.0.2
+// @version 1.0.4
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/电影人生.js
 
 const OmniBox = require("omnibox_sdk");
@@ -81,6 +81,45 @@ function buildFilters() {
       zongyi: commonZy,
     },
   };
+}
+
+function normalizeSearchKeyword(value) {
+  return String(value || "")
+    .replace(/[\s\-_—–·•:：,，.。!?！？'"“”‘’()（）\[\]【】{}]/g, "")
+    .toLowerCase();
+}
+
+function buildSearchTokens(keyword) {
+  const base = normalizeSearchKeyword(keyword);
+  if (!base) return [];
+  const tokens = new Set([base]);
+  const digitStripped = base.replace(/\d+$/g, "");
+  if (digitStripped && digitStripped !== base) tokens.add(digitStripped);
+  const noYear = base.replace(/(19|20)\d{2}/g, "");
+  if (noYear && noYear !== base) tokens.add(noYear);
+  return [...tokens].filter(Boolean).sort((a, b) => b.length - a.length);
+}
+
+function scoreSearchResult(vodName, keyword) {
+  const name = normalizeSearchKeyword(vodName);
+  const tokens = buildSearchTokens(keyword);
+  if (!name || !tokens.length) return 0;
+  let score = 0;
+  for (const token of tokens) {
+    if (name === token) score = Math.max(score, 1000 + token.length);
+    else if (name.startsWith(token)) score = Math.max(score, 800 + token.length);
+    else if (name.includes(token)) score = Math.max(score, 600 + token.length);
+  }
+  return score;
+}
+
+function refineSearchResults(list, keyword) {
+  const scored = list.map((item) => ({ item, score: scoreSearchResult(item.vod_name, keyword) }));
+  const matched = scored
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || String(a.item.vod_name || "").localeCompare(String(b.item.vod_name || ""), "zh-Hans-CN"))
+    .map((entry) => entry.item);
+  return matched.length ? matched : list;
 }
 
 function parseVodCards(html) {
@@ -282,17 +321,19 @@ async function search(params, context) {
     const page = Number(params.page || 1) || 1;
     if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
 
-    const qs = new URLSearchParams({ wd: keyword });
-    if (page > 1) qs.set("page", String(page));
-    const url = `${BASE_URL}/search.html?${qs.toString()}`;
+    const qs = new URLSearchParams({ name: keyword });
+    if (page > 1) qs.set("page", String(page - 1));
+    const url = `${BASE_URL}/s.html?${qs.toString()}`;
     await OmniBox.log("info", `[电影人生][search] ${url}`);
     const html = await fetchText(url);
     const list = parseVodCards(html);
+    const refinedList = refineSearchResults(list, keyword);
+    await OmniBox.log("info", `[电影人生][search] raw=${list.length} refined=${refinedList.length} keyword=${keyword}`);
     return {
       page,
-      pagecount: page + (list.length >= 24 ? 1 : 0),
-      total: page * 24 + list.length,
-      list,
+      pagecount: page + (refinedList.length >= 24 ? 1 : 0),
+      total: page * 24 + refinedList.length,
+      list: refinedList,
     };
   } catch (e) {
     await OmniBox.log("error", `[电影人生][search] ${e.message}`);
