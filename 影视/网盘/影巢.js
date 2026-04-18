@@ -2,7 +2,7 @@
 // @author lampon
 // @description
 // @dependencies axios
-// @version 1.0.0
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/影巢.js
 
 const OmniBox = require("omnibox_sdk");
@@ -47,6 +47,21 @@ const HDHIVE_PROXY_URL = process.env.HDHIVE_PROXY_URL || "";
 const PANCHECK_API = process.env.PANCHECK_API || "";
 const PANCHECK_ENABLED = true;
 const PANCHECK_PLATFORMS = process.env.PANCHECK_PLATFORMS || "quark";
+// 读取环境变量：支持多个网盘类型，用分号分割；仅这些网盘类型启用多线路
+const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "quark;uc")
+  .split(";")
+  .map((t) => t.trim().toLowerCase())
+  .filter(Boolean);
+// 读取环境变量：线路名称和顺序，用分号分割
+const SOURCE_NAMES_CONFIG = (process.env.SOURCE_NAMES_CONFIG || "本地代理;服务端代理;直连")
+  .split(";")
+  .map((s) => s.trim())
+  .filter(Boolean);
+// 读取环境变量：详情页播放线路的网盘排序顺序。仅作用于 detail() 里的播放线路。
+const DRIVE_ORDER = (process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan")
+  .split(";")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 // ==================== 配置区域结束 ====================
 
 let tmdbKeyCache = "";
@@ -252,6 +267,91 @@ function getTypeNameByMediaType(mediaType) {
   return mediaType === "movie" ? "电影资源" : "剧集资源";
 }
 
+function inferDriveTypeFromSourceName(name = "") {
+  const raw = String(name || "").toLowerCase();
+  if (raw.includes("百度")) return "baidu";
+  if (raw.includes("天翼")) return "tianyi";
+  if (raw.includes("夸克")) return "quark";
+  if (raw === "uc" || raw.includes("uc")) return "uc";
+  if (raw.includes("115")) return "115";
+  if (raw.includes("迅雷")) return "xunlei";
+  if (raw.includes("阿里")) return "ali";
+  if (raw.includes("123")) return "123pan";
+  return raw;
+}
+
+function sortPlaySourcesByDriveOrder(playSources = []) {
+  if (!Array.isArray(playSources) || playSources.length <= 1 || DRIVE_ORDER.length === 0) {
+    return playSources;
+  }
+  const orderMap = new Map(DRIVE_ORDER.map((name, index) => [name, index]));
+  return [...playSources].sort((a, b) => {
+    const aBase = String(a?.baseSourceName || a?.name || "");
+    const bBase = String(b?.baseSourceName || b?.name || "");
+    const aType = inferDriveTypeFromSourceName(aBase);
+    const bType = inferDriveTypeFromSourceName(bBase);
+    const aOrder = orderMap.has(aType) ? orderMap.get(aType) : Number.MAX_SAFE_INTEGER;
+    const bOrder = orderMap.has(bType) ? orderMap.get(bType) : Number.MAX_SAFE_INTEGER;
+    if (aOrder !== bOrder) return aOrder - bOrder;
+    return 0;
+  });
+}
+
+function normalizeEpisodeKeyword(value) {
+  return safeString(value)
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[【】\[\]()（）._\-]/g, "");
+}
+
+function pickBestEpisodeFile(files = [], episodeName = "") {
+  if (!Array.isArray(files) || files.length === 0) return null;
+  const keyword = normalizeEpisodeKeyword(episodeName);
+  if (keyword) {
+    const matched = files.find((file) =>
+      normalizeEpisodeKeyword(file?.episodeName || file?.file_name).includes(keyword),
+    );
+    if (matched) return matched;
+  }
+  return files[0] || null;
+}
+
+function sanitizeLegacyPlayText(value) {
+  return safeString(value).replace(/[#$]/g, " ").trim();
+}
+
+function buildLegacyPlayFields(playSources = []) {
+  if (!Array.isArray(playSources) || playSources.length === 0) {
+    return { vod_play_from: "", vod_play_url: "" };
+  }
+
+  const vodPlayFrom = [];
+  const vodPlayUrl = [];
+
+  for (const source of playSources) {
+    const sourceName = sanitizeLegacyPlayText(source?.name || "默认线路") || "默认线路";
+    const episodes = Array.isArray(source?.episodes) ? source.episodes : [];
+    const episodeItems = episodes
+      .map((episode, index) => {
+        const epName = sanitizeLegacyPlayText(episode?.name || episode?.episodeName || `第${index + 1}集`) || `第${index + 1}集`;
+        const playId = safeString(episode?.playId || "");
+        if (!playId) return "";
+        return `${epName}$${playId}`;
+      })
+      .filter(Boolean);
+
+    if (episodeItems.length > 0) {
+      vodPlayFrom.push(sourceName);
+      vodPlayUrl.push(episodeItems.join("#"));
+    }
+  }
+
+  return {
+    vod_play_from: vodPlayFrom.join("$$$"),
+    vod_play_url: vodPlayUrl.join("$$$"),
+  };
+}
+
 function isVideoFile(file) {
   if (!file || !file.file_name) return false;
   const fileName = String(file.file_name).toLowerCase();
@@ -398,6 +498,113 @@ function getPanName(panType) {
 
 function getPanIcon(panType) {
   return PAN_PICS[panType] || "";
+}
+
+const TMDB_MOVIE_GENRES = {
+  action: 28,
+  adventure: 12,
+  animation: 16,
+  comedy: 35,
+  crime: 80,
+  documentary: 99,
+  drama: 18,
+  family: 10751,
+  fantasy: 14,
+  history: 36,
+  horror: 27,
+  music: 10402,
+  mystery: 9648,
+  romance: 10749,
+  science_fiction: 878,
+  tv_movie: 10770,
+  thriller: 53,
+  war: 10752,
+  western: 37,
+};
+
+const TMDB_TV_GENRES = {
+  action_adventure: 10759,
+  animation: 16,
+  comedy: 35,
+  crime: 80,
+  documentary: 99,
+  drama: 18,
+  family: 10751,
+  kids: 10762,
+  mystery: 9648,
+  news: 10763,
+  reality: 10764,
+  sci_fi_fantasy: 10765,
+  soap: 10766,
+  talk: 10767,
+  war_politics: 10768,
+  western: 37,
+};
+
+const TMDB_REGION_MAP = {
+  all: "",
+  cn: "CN",
+  us: "US",
+  jp: "JP",
+  kr: "KR",
+  hk: "HK",
+  tw: "TW",
+  gb: "GB",
+  fr: "FR",
+  de: "DE",
+  in: "IN",
+  th: "TH",
+};
+
+function buildDiscoverSort(sortValue, mediaType) {
+  if (sortValue === "score") return "vote_average.desc";
+  if (sortValue === "time") {
+    return mediaType === "movie" ? "release_date.desc" : "first_air_date.desc";
+  }
+  return "popularity.desc";
+}
+
+function buildDiscoverFilters(mediaType, filters = {}) {
+  const q = {};
+  const genre = safeString(filters.genre || "");
+  const region = safeString(filters.region || "");
+  const year = safeString(filters.year || "");
+  const sort = safeString(filters.sort || "hot");
+
+  if (genre) {
+    const gid =
+      mediaType === "movie"
+        ? TMDB_MOVIE_GENRES[genre] || ""
+        : TMDB_TV_GENRES[genre] || "";
+    if (gid) q.with_genres = gid;
+  }
+
+  if (region) {
+    const rc = TMDB_REGION_MAP[region] || "";
+    if (rc) {
+      q.with_origin_country = rc;
+    }
+  }
+
+  if (year) {
+    if (/^\d{4}$/.test(year)) {
+      if (mediaType === "movie") q.primary_release_year = year;
+      else q.first_air_date_year = year;
+    } else if (/^\d{4}s$/.test(year)) {
+      const startYear = year.slice(0, 4);
+      const endYear = String(Number(startYear) + 9);
+      if (mediaType === "movie") {
+        q["primary_release_date.gte"] = `${startYear}-01-01`;
+        q["primary_release_date.lte"] = `${endYear}-12-31`;
+      } else {
+        q["first_air_date.gte"] = `${startYear}-01-01`;
+        q["first_air_date.lte"] = `${endYear}-12-31`;
+      }
+    }
+  }
+
+  q.sort_by = buildDiscoverSort(sort, mediaType);
+  return q;
 }
 
 async function checkLinksWithPanCheck(links) {
@@ -734,7 +941,145 @@ async function home(params, context) {
       { type_id: "tv_popular", type_name: "热门电视剧" },
       { type_id: "movie_top_rated", type_name: "高分电影" },
       { type_id: "tv_top_rated", type_name: "高分电视剧" },
+      { type_id: "movie_filter", type_name: "电影筛选" },
+      { type_id: "tv_filter", type_name: "电视剧筛选" },
     ];
+
+    const filters = {
+      movie_filter: [
+        {
+          key: "genre",
+          name: "类型",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "动作", value: "action" },
+            { name: "喜剧", value: "comedy" },
+            { name: "爱情", value: "romance" },
+            { name: "科幻", value: "science_fiction" },
+            { name: "动画", value: "animation" },
+            { name: "悬疑", value: "mystery" },
+            { name: "犯罪", value: "crime" },
+            { name: "惊悚", value: "thriller" },
+            { name: "恐怖", value: "horror" },
+            { name: "剧情", value: "drama" },
+            { name: "纪录片", value: "documentary" },
+          ],
+        },
+        {
+          key: "region",
+          name: "地区",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "中国", value: "cn" },
+            { name: "美国", value: "us" },
+            { name: "日本", value: "jp" },
+            { name: "韩国", value: "kr" },
+            { name: "中国香港", value: "hk" },
+            { name: "中国台湾", value: "tw" },
+            { name: "英国", value: "gb" },
+            { name: "法国", value: "fr" },
+            { name: "德国", value: "de" },
+            { name: "印度", value: "in" },
+            { name: "泰国", value: "th" },
+          ],
+        },
+        {
+          key: "year",
+          name: "年代",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "2026", value: "2026" },
+            { name: "2025", value: "2025" },
+            { name: "2024", value: "2024" },
+            { name: "2023", value: "2023" },
+            { name: "2022", value: "2022" },
+            { name: "2021", value: "2021" },
+            { name: "2020s", value: "2020s" },
+            { name: "2010s", value: "2010s" },
+            { name: "2000s", value: "2000s" },
+          ],
+        },
+        {
+          key: "sort",
+          name: "排序",
+          init: "hot",
+          value: [
+            { name: "热度", value: "hot" },
+            { name: "评分", value: "score" },
+            { name: "时间", value: "time" },
+          ],
+        },
+      ],
+      tv_filter: [
+        {
+          key: "genre",
+          name: "类型",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "动作冒险", value: "action_adventure" },
+            { name: "喜剧", value: "comedy" },
+            { name: "悬疑", value: "mystery" },
+            { name: "科幻奇幻", value: "sci_fi_fantasy" },
+            { name: "动画", value: "animation" },
+            { name: "真人秀", value: "reality" },
+            { name: "脱口秀", value: "talk" },
+            { name: "剧情", value: "drama" },
+            { name: "犯罪", value: "crime" },
+            { name: "纪录片", value: "documentary" },
+          ],
+        },
+        {
+          key: "region",
+          name: "地区",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "中国", value: "cn" },
+            { name: "美国", value: "us" },
+            { name: "日本", value: "jp" },
+            { name: "韩国", value: "kr" },
+            { name: "中国香港", value: "hk" },
+            { name: "中国台湾", value: "tw" },
+            { name: "英国", value: "gb" },
+            { name: "法国", value: "fr" },
+            { name: "德国", value: "de" },
+            { name: "印度", value: "in" },
+            { name: "泰国", value: "th" },
+          ],
+        },
+        {
+          key: "year",
+          name: "年代",
+          init: "",
+          value: [
+            { name: "全部", value: "" },
+            { name: "2026", value: "2026" },
+            { name: "2025", value: "2025" },
+            { name: "2024", value: "2024" },
+            { name: "2023", value: "2023" },
+            { name: "2022", value: "2022" },
+            { name: "2021", value: "2021" },
+            { name: "2020s", value: "2020s" },
+            { name: "2010s", value: "2010s" },
+            { name: "2000s", value: "2000s" },
+          ],
+        },
+        {
+          key: "sort",
+          name: "排序",
+          init: "hot",
+          value: [
+            { name: "热度", value: "hot" },
+            { name: "评分", value: "score" },
+            { name: "时间", value: "time" },
+          ],
+        },
+      ],
+    };
 
     // 首页推荐：混合热度榜 + 热门 + 高分
     const [trendMovies, trendTV, popularMovies, popularTV] = await Promise.all([
@@ -820,6 +1165,7 @@ async function home(params, context) {
     return {
       class: classList,
       list,
+      filters,
     };
   } catch (error) {
     try {
@@ -883,6 +1229,20 @@ async function category(params, context) {
       apiPath: "/trending/tv/day",
       typeName: "热度榜（剧集）",
       remarks: "热度榜",
+    },
+    movie_filter: {
+      mediaType: "movie",
+      apiPath: "/discover/movie",
+      typeName: "电影筛选",
+      remarks: "筛选",
+      isDiscover: true,
+    },
+    tv_filter: {
+      mediaType: "tv",
+      apiPath: "/discover/tv",
+      typeName: "电视剧筛选",
+      remarks: "筛选",
+      isDiscover: true,
     },
   };
 
@@ -1096,9 +1456,10 @@ async function category(params, context) {
       // ignore
     }
 
-    // TODO: 这里先不使用 filters（你后续要扩展：按 genre 再补 discover/discover+genre 的逻辑）
-    // 先直接调用对应 tmdb 分类接口。
-    const data = await tmdbGet(cfg.apiPath, { page });
+    const discoverParams = cfg.isDiscover
+      ? buildDiscoverFilters(cfg.mediaType, filters)
+      : {};
+    const data = await tmdbGet(cfg.apiPath, { page, ...discoverParams });
 
     const results = Array.isArray(data?.results) ? data.results : [];
     const total = Number(data?.total_results || 0);
@@ -1336,14 +1697,14 @@ async function detail(params, context) {
 
     const source = safeString(params?.source || "");
     let sourceNames = [sourceName];
-    if (driveInfo?.driveType === "quark" || driveInfo?.driveType === "uc") {
-      sourceNames = ["服务端代理", "本地代理", "直连"];
+    if (DRIVE_TYPE_CONFIG.includes(String(driveInfo?.driveType || "").toLowerCase())) {
+      sourceNames = [...SOURCE_NAMES_CONFIG];
       if (source === "web") {
         sourceNames = sourceNames.filter((name) => name !== "本地代理");
       }
     }
 
-    const playSources = [];
+    let playSources = [];
     for (const lineName of sourceNames) {
       const episodes = [];
       for (const file of allVideoFiles) {
@@ -1417,11 +1778,24 @@ async function detail(params, context) {
       }
 
       if (episodes.length > 0) {
+        const baseLineName = sourceName;
+        const finalLineName =
+          DRIVE_TYPE_CONFIG.includes(String(driveInfo?.driveType || "").toLowerCase())
+            ? `${baseLineName}-${lineName}`
+            : `${baseLineName}-网盘线路`;
         playSources.push({
-          name: lineName,
+          name: finalLineName,
+          baseSourceName: baseLineName,
           episodes,
         });
       }
+    }
+
+    if (playSources.length > 1 && DRIVE_ORDER.length > 0) {
+      playSources = sortPlaySourcesByDriveOrder(playSources).map((item) => ({
+        name: item.name,
+        episodes: item.episodes,
+      }));
     }
 
     let tmdbTitle = payload.title || scrapeData?.title || "";
@@ -1472,6 +1846,8 @@ async function detail(params, context) {
       );
     }
 
+    const legacyPlayFields = buildLegacyPlayFields(playSources);
+
     return {
       list: [
         {
@@ -1484,6 +1860,8 @@ async function detail(params, context) {
           vod_content:
             tmdbOverview || `HDHive 资源，共 ${episodes.length} 个视频文件`,
           vod_play_sources: playSources,
+          vod_play_from: legacyPlayFields.vod_play_from,
+          vod_play_url: legacyPlayFields.vod_play_url,
           vod_douban_score: tmdbScore,
         },
       ],
@@ -1504,13 +1882,36 @@ async function play(params, context) {
     if (!playId) throw new Error("playId 不能为空");
 
     const parts = playId.split("|");
-    if (parts.length < 2) throw new Error(`playId 格式错误: ${playId}`);
-    const shareURL = safeString(parts[0]);
-    const fileId = safeString(parts[1]);
+    let shareURL = safeString(parts[0]);
+    let fileId = safeString(parts[1]);
     // 第三段可能是 detail 透传过来的原始 vodId（JSON字符串）
-    const rawVodIdFromPlayId =
+    let rawVodIdFromPlayId =
       parts.length >= 3 ? safeString(parts.slice(2).join("|")) : "";
-    if (!shareURL || !fileId) throw new Error("分享链接或文件ID为空");
+
+    if (!shareURL) throw new Error("分享链接为空");
+
+    if (!fileId) {
+      await OmniBox.log(
+        "warn",
+        `tmdb.js play 收到缺少 fileId 的 playId，尝试按 shareURL 兜底解析: ${playId}`,
+      );
+      const rootList = await OmniBox.getDriveFileList(shareURL, "0");
+      const allVideoFiles = await getAllVideoFiles(shareURL, rootList?.files || []);
+      const enrichedFiles = allVideoFiles.map((file) => ({
+        ...file,
+        fileId: safeString(file?.fid || file?.file_id),
+        episodeName: safeString(file?.episodeName || params?.episodeName || ""),
+      })).filter((file) => file.fileId);
+      const matchedFile = pickBestEpisodeFile(enrichedFiles, params?.episodeName || "");
+      if (!matchedFile || !matchedFile.fileId) {
+        throw new Error(`playId 缺少文件ID且兜底未找到可播放文件: ${playId}`);
+      }
+      fileId = safeString(matchedFile.fileId);
+      await OmniBox.log(
+        "info",
+        `tmdb.js play 兜底命中文件: ${safeString(matchedFile.file_name)} -> ${fileId}`,
+      );
+    }
 
     // 参考 pansou.js：匹配元数据用于弹幕和历史写入
     let danmakuList = [];
@@ -1560,10 +1961,19 @@ async function play(params, context) {
       );
     }
 
+    let routeType = safeString(flag);
+    if (routeType && routeType.includes("-")) {
+      const parts = routeType.split("-");
+      routeType = safeString(parts[parts.length - 1]);
+    }
+    if (!routeType) {
+      routeType = safeString(params?.source) === "web" ? "服务端代理" : "直连";
+    }
+
     const playInfo = await OmniBox.getDriveVideoPlayInfo(
       shareURL,
       fileId,
-      "服务端代理",
+      routeType,
     );
     if (
       !playInfo ||
