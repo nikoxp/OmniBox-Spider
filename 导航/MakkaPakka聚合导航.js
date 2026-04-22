@@ -2,7 +2,7 @@
 // @author 梦
 // @description 基于 AstrBot Widget 通用桥接的 OmniBox 导航源，动态读取远端 Widget Metadata 与模块函数
 // @indexs 1
-// @version 1.0.3
+// @version 1.0.4
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/导航/MakkaPakka聚合导航.js
 
 const OmniBox = require("omnibox_sdk");
@@ -12,7 +12,7 @@ const cheerio = require("cheerio");
 
 const WIDGET_URL =
   process.env.MAKKA_WIDGET_URL ||
-  "https://raw.githubusercontent.com/MakkaPakka518/FW/refs/heads/main/widgets/mk-2.0/MakkaPakka-ALL.js";
+  "https://gh-proxy.org/https://raw.githubusercontent.com/MakkaPakka518/FW/refs/heads/main/widgets/mk-2.0/MakkaPakka-ALL.js";
 const CACHE_TTL_MS = parseInt(process.env.MAKKA_WIDGET_CACHE_MS || "1800000", 10);
 const DEFAULT_PAGE_SIZE = 20;
 const REQUEST_TIMEOUT_MS = parseInt(process.env.MAKKA_WIDGET_TIMEOUT_MS || "20000", 10);
