@@ -10,7 +10,16 @@
  * @downloadURL https://github.com/Silent1566/OmniBox-Spider/raw/main/影视/采集/歪比巴卜.js
  */
 
-const OmniBox = require('omnibox_sdk');
+let OmniBox;
+try {
+  OmniBox = require('omnibox_sdk');
+} catch (_) {
+  OmniBox = {
+    log(level, message) {
+      console.log(`[${level}] ${message}`);
+    },
+  };
+}
 const runner = require('spider_runner');
 const axios = require('axios');
 const http = require('http');
