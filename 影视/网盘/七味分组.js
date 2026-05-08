@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持，仅保留七味网盘线路的分组版本
 // @dependencies: axios, cheerio
-// @version      1.5.0
+// @version      1.6.19
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/七味分组.js
 
 const axios = require("axios");
@@ -14,12 +14,17 @@ const DANMU_API = process.env.DANMU_API || "";
 const PANCHECK_API = process.env.PANCHECK_API || "";
 const PANCHECK_ENABLED = String(process.env.PANCHECK_ENABLED || (PANCHECK_API ? "true" : "false")).toLowerCase() === "true";
 const PANCHECK_PLATFORMS = process.env.PANCHECK_PLATFORMS || "quark,baidu,uc,pan123,tianyi,cmcc,aliyun,xunlei,115";
+const QIWEI_115_COOKIE = process.env.QIWEI_115_COOKIE || process.env.WOOG_115_COOKIE || process.env.PAN_115_COOKIE || "";
 
 function splitConfigList(value) {
     return String(value || "")
         .split(/[;,]/)
         .map((item) => item.trim())
         .filter(Boolean);
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
 const MAX_PAN_VALID_ROUTES = (() => {
@@ -32,6 +37,7 @@ const SOURCE_NAMES_CONFIG = splitConfigList(process.env.SOURCE_NAMES_CONFIG || "
 const EXTERNAL_SERVER_PROXY_ENABLED = String(process.env.EXTERNAL_SERVER_PROXY_ENABLED || "false").toLowerCase() === "true";
 const DRIVE_ORDER = splitConfigList(process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan").map((s) => s.toLowerCase());
 const QIWEI_CACHE_EX_SECONDS = Number(process.env.QIWEI_CACHE_EX_SECONDS || 43200);
+const QIWEI_115_MAGNET_CACHE_EX_SECONDS = Number(process.env.QIWEI_115_MAGNET_CACHE_EX_SECONDS || 2592000);
 const QIWEI_PAN_CACHE_VERSION = "v4";
 const PAN_ROUTE_NAMES = SOURCE_NAMES_CONFIG.slice(0, MAX_PAN_VALID_ROUTES);
 
@@ -577,6 +583,147 @@ function formatFileSize(size) {
     return `${sizeFloat.toFixed(2)}${units[exp]}`;
 }
 
+function cleanPlayLabel(value = "", fallback = "") {
+    const cleaned = normalizeText(value)
+        .replace(/[#$]+/g, " ")
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    return cleaned || fallback;
+}
+
+function stripEpisodeSerialSuffix(name = "", index = 0) {
+    const value = cleanPlayLabel(name);
+    const serial = String((parseInt(index, 10) || 0) + 1);
+    if (!value || !serial) return value;
+    const escaped = serial.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return value
+        .replace(new RegExp(`([\\]】）)])\\s*${escaped}$`, "u"), "$1")
+        .replace(new RegExp(`(\\[[^\\]]{1,24}\\])\\s*${escaped}$`, "u"), "$1")
+        .trim();
+}
+
+const PLAY_EPISODE_NAME_MAX_LENGTH = 32;
+
+function truncatePlayLabel(value = "", maxLength = PLAY_EPISODE_NAME_MAX_LENGTH) {
+    const raw = cleanPlayLabel(value);
+    const limit = Math.max(8, Number(maxLength) || PLAY_EPISODE_NAME_MAX_LENGTH);
+    if (!raw || raw.length <= limit) return raw;
+    return `${raw.slice(0, limit - 1)}…`;
+}
+
+function buildEpisodeButtonName(ep = {}, index = 0, defaultPrefix = "资源") {
+    const raw = cleanPlayLabel(ep?._displayName || ep?.name || ep?.episodeName || ep?._rawName || ep?.fileName || ep?.file_name || ep?.title || "");
+    const rangeStart = Number.isFinite(ep?._episodeRangeStart) ? ep._episodeRangeStart : (Number.isFinite(ep?.episodeRangeStart) ? ep.episodeRangeStart : null);
+    const rangeEnd = Number.isFinite(ep?._episodeRangeEnd) ? ep._episodeRangeEnd : (Number.isFinite(ep?.episodeRangeEnd) ? ep.episodeRangeEnd : null);
+    if (rangeStart && rangeEnd) return formatEpisodeRangeLabel({ start: rangeStart, end: rangeEnd }, raw);
+    const episodeNumber = Number.isFinite(ep?._episodeNumber) ? ep._episodeNumber : (Number.isFinite(ep?.episodeNumber) ? ep.episodeNumber : extractEpisodeNumber(raw));
+    if (episodeNumber) return formatEpisodeLabel(episodeNumber, raw);
+    return truncatePlayLabel(cleanPlayLabel(raw, `${defaultPrefix}${index + 1}`));
+}
+
+function pickEpisodeDisplayName(ep = {}, defaultPrefix = "资源", index = 0) {
+    return truncatePlayLabel(buildEpisodeButtonName(ep, index, defaultPrefix));
+}
+
+function build115ButtonName(index = 0) {
+    return `115资源${(parseInt(index, 10) || 0) + 1}`;
+}
+
+function build115EpisodeDisplayName(ep = {}, index = 0) {
+    const rawName = cleanPlayLabel(ep?._rawName || ep?.fileName || ep?.file_name || ep?._displayName || ep?.name || "");
+    return rawName || build115ButtonName(index);
+}
+
+function build115MagnetPlayId(meta = {}) {
+    return Buffer.from(JSON.stringify({
+        kind: "115magnetplay",
+        magnet: String(meta.magnet || "").trim(),
+        fileName: String(meta.fileName || "").trim(),
+        fileId: String(meta.fileId || "").trim(),
+        pickcode: String(meta.pickcode || "").trim(),
+    }), "utf8").toString("base64");
+}
+
+function decode115MagnetPlayMeta(playId) {
+    const raw = String(playId || "").trim();
+    if (!raw) return {};
+    const base64 = raw.replace(/^115magnet:/, "");
+    try {
+        const decoded = Buffer.from(base64, "base64").toString("utf8");
+        const data = safeJsonParse(decoded, {}) || {};
+        return data && typeof data === "object" ? data : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function is115MagnetPlayId(playId, flag = "") {
+    if (String(playId || "").trim().startsWith("115magnet:")) return true;
+    if (String(flag || "").trim() === "115秒传") return true;
+    return decode115MagnetPlayMeta(playId)?.kind === "115magnetplay";
+}
+
+function sanitizeLegacyPlayText(value) {
+    return cleanPlayLabel(value).replace(/[#$]/g, " ").trim();
+}
+
+function buildLegacyPlayFields(playSources = []) {
+    if (!Array.isArray(playSources) || playSources.length === 0) {
+        return { vod_play_from: "", vod_play_url: "" };
+    }
+    const vodPlayFrom = [];
+    const vodPlayUrl = [];
+    for (const source of playSources) {
+        const sourceName = sanitizeLegacyPlayText(source?.name || "默认线路") || "默认线路";
+        const episodes = Array.isArray(source?.episodes) ? source.episodes : [];
+        const episodeItems = episodes.map((episode, index) => {
+            const epName = sanitizeLegacyPlayText(stripEpisodeSerialSuffix(pickEpisodeDisplayName(episode, "第", index), index)) || `第${index + 1}集`;
+            const playId = String(episode?.playId || "").trim();
+            if (!playId) return "";
+            return `${epName}$${playId}`;
+        }).filter(Boolean);
+        if (episodeItems.length > 0) {
+            vodPlayFrom.push(sourceName);
+            vodPlayUrl.push(episodeItems.join("#"));
+        }
+    }
+    return {
+        vod_play_from: vodPlayFrom.join("$$$"),
+        vod_play_url: vodPlayUrl.join("$$$"),
+    };
+}
+
+function summarizePlaySourcesForLog(playSources = []) {
+    return (Array.isArray(playSources) ? playSources : []).map((source) => {
+        const episodes = Array.isArray(source?.episodes) ? source.episodes : [];
+        return {
+            name: source?.name || "",
+            episodeCount: episodes.length,
+            episodePreview: episodes.slice(0, 5).map((episode) => ({
+                name: episode?.name || episode?.episodeName || episode?.title || "",
+                playIdPreview: String(episode?.playId || "").slice(0, 160),
+            })),
+        };
+    });
+}
+
+function summarizePlayResultForLog(result = {}) {
+    const urls = Array.isArray(result?.urls) ? result.urls : [];
+    return {
+        keys: Object.keys(result || {}),
+        parse: result?.parse,
+        flag: result?.flag || "",
+        urlCount: urls.length,
+        urls: urls.map((item) => ({
+            name: item?.name || "",
+            urlPreview: String(item?.url || "").slice(0, 240),
+        })),
+        headerKeys: result?.header && typeof result.header === "object" ? Object.keys(result.header) : [],
+        danmakuCount: Array.isArray(result?.danmaku) ? result.danmaku.length : 0,
+    };
+}
+
 function buildCacheKey(prefix, value) {
     const normalizedPrefix = String(prefix || "").trim();
     const normalizedValue = String(value || "").trim();
@@ -620,6 +767,10 @@ async function deleteCachedJSON(key) {
         logWarn("删除缓存失败", { key, error: error.message || String(error) });
         return false;
     }
+}
+
+function build115MagnetCacheKey(magnet = "") {
+    return buildCacheKey(`qiwei-group:115-magnet:${QIWEI_PAN_CACHE_VERSION}`, String(magnet || "").trim().toLowerCase());
 }
 
 function inferDriveTypeFromSourceName(name = "") {
@@ -2210,33 +2361,48 @@ async function buildAndCacheVideoPanDetail(video = {}) {
     return payload;
 }
 
-async function getCachedOrBuildVideoPanDetail(video = {}) {
+async function getCachedOrBuildVideoPanDetail(video = {}, options = {}) {
     const videoId = String(video?.vod_id || "").trim();
     if (!videoId) return null;
-    let cached = await getCachedJSON(buildPanGroupDirectoryCacheKey(videoId));
-    if (cached && cached.grouped) {
-        return cached;
-    }
-    cached = await getCachedJSON(buildSearchResultDetailCacheKey(videoId));
-    if (cached && cached.grouped) {
-        await setCachedJSON(buildPanGroupDirectoryCacheKey(videoId), cached, QIWEI_CACHE_EX_SECONDS);
-        return cached;
+    const forceRefresh = options.forceRefresh === true;
+    if (!forceRefresh) {
+        let cached = await getCachedJSON(buildPanGroupDirectoryCacheKey(videoId));
+        if (cached && cached.grouped) {
+            return cached;
+        }
+        cached = await getCachedJSON(buildSearchResultDetailCacheKey(videoId));
+        if (cached && cached.grouped) {
+            await setCachedJSON(buildPanGroupDirectoryCacheKey(videoId), cached, QIWEI_CACHE_EX_SECONDS);
+            return cached;
+        }
+    } else {
+        logInfo("强制刷新详情分组缓存", { videoId, reason: options.reason || "force_refresh" });
     }
     return await buildAndCacheVideoPanDetail(video);
 }
 
-function buildScrapedEpisodeName(scrapeData, mapping, fallbackName) {
-    const title = String(scrapeData?.title || "").trim();
-    const episodeName = String(mapping?.episodeName || "").trim();
-    const seasonNumber = mapping?.seasonNumber;
-    const episodeNumber = mapping?.episodeNumber;
-    if (title && Number.isFinite(seasonNumber) && Number.isFinite(episodeNumber)) {
-        return `${title} S${String(seasonNumber).padStart(2, "0")}E${String(episodeNumber).padStart(2, "0")}${episodeName ? ` ${episodeName}` : ""}`.trim();
+function buildScrapedEpisodeName(scrapeData, mapping, fallbackName, displayName = "") {
+    if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+        return fallbackName;
     }
-    if (title && episodeName) {
-        return `${title} ${episodeName}`.trim();
+    const scrapedEpisodeName = String(mapping?.episodeName || "").trim();
+    const episodeNumber = Number(mapping?.episodeNumber);
+    const fallbackText = cleanPlayLabel(displayName || fallbackName || "", fallbackName || "");
+    const sizePrefix = (fallbackText.match(/^\[[^\]]+\]\s*/) || [""])[0];
+    let episodeLabel = "";
+    const range = extractEpisodeRange(fallbackText || fallbackName || "");
+    if (range) {
+        episodeLabel = formatEpisodeRangeLabel(range);
+    } else if (Number.isFinite(episodeNumber) && episodeNumber > 0) {
+        episodeLabel = formatEpisodeLabel(episodeNumber);
+    } else {
+        const fallbackEpisodeNumber = extractEpisodeNumber(fallbackText || fallbackName || "");
+        if (Number.isFinite(fallbackEpisodeNumber) && fallbackEpisodeNumber > 0) episodeLabel = formatEpisodeLabel(fallbackEpisodeNumber);
     }
-    return fallbackName;
+    if (scrapedEpisodeName) {
+        return cleanPlayLabel(`${sizePrefix}${episodeLabel ? `${episodeLabel} ` : ""}${scrapedEpisodeName}`, fallbackName);
+    }
+    return fallbackText || fallbackName;
 }
 
 function buildScrapedDanmuFileName(scrapeData, scrapeType, mapping, fallbackVodName = "", fallbackEpisodeName = "") {
@@ -2276,6 +2442,91 @@ async function matchDanmu(fileName = "") {
     } catch (error) {
         logWarn("弹幕匹配失败", { fileName, error: error.message || String(error) });
         return [];
+    }
+}
+
+function rewritePlayIdMeta(playId = "", patchMeta = {}) {
+    const raw = String(playId || "").trim();
+    if (!raw.includes("|||")) return raw;
+    const [mainPlayId, metaB64] = raw.split("|||");
+    const meta = { ...decodeMeta(metaB64 || ""), ...patchMeta };
+    return `${mainPlayId}|||${encodeMeta(meta)}`;
+}
+
+function normalizeScrapeFileName(value = "") {
+    return normalizeText(value)
+        .split(/[\\/]/)
+        .pop()
+        .replace(/\.[a-z0-9]{2,5}$/i, "")
+        .replace(/[._\-\[\]()【】（）]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function buildScrapeMappingByEpisode(metadata = {}) {
+    const mappings = Array.isArray(metadata?.videoMappings) ? metadata.videoMappings : [];
+    const byEpisode = new Map();
+    for (const mapping of mappings) {
+        const ep = Number(mapping?.episodeNumber);
+        if (!Number.isFinite(ep) || ep <= 0) continue;
+        if (!byEpisode.has(ep)) byEpisode.set(ep, mapping);
+    }
+    return byEpisode;
+}
+
+function findScrapeMapping(metadata = {}, candidates = [], episodeNumber = null, rawName = "") {
+    const mappings = Array.isArray(metadata?.videoMappings) ? metadata.videoMappings : [];
+    for (const key of candidates.map((item) => String(item || "").trim()).filter(Boolean)) {
+        const mapping = mappings.find((item) => String(item?.fileId || "").trim() === key);
+        if (mapping) return mapping;
+    }
+    const epNo = Number(episodeNumber);
+    if (Number.isFinite(epNo) && epNo > 0) {
+        const mapping = buildScrapeMappingByEpisode(metadata).get(epNo);
+        if (mapping) return mapping;
+    }
+    const normalizedRawName = normalizeScrapeFileName(rawName);
+    if (normalizedRawName) {
+        const mapping = mappings.find((item) => {
+            const mappingName = normalizeScrapeFileName(item?.fileName || item?.file_name || item?.name || item?.sourceFileName || item?.sourceName || "");
+            return mappingName && (mappingName === normalizedRawName || mappingName.includes(normalizedRawName) || normalizedRawName.includes(mappingName));
+        });
+        if (mapping) return mapping;
+    }
+    return null;
+}
+
+function addPlayHistoryAsync(payload = {}) {
+    if (typeof OmniBox?.addPlayHistory !== "function") return;
+    const sourceId = String(payload.sourceId || "").trim();
+    const vodId = String(payload.vodId || "").trim();
+    const title = String(payload.title || "").trim();
+    if (!sourceId || !vodId || !title) {
+        logWarn("跳过播放记录", { reason: "missing_required_fields", hasSourceId: !!sourceId, vodId, title });
+        return;
+    }
+    try {
+        OmniBox.addPlayHistory({
+            vodId,
+            title,
+            pic: String(payload.pic || "").trim(),
+            episode: String(payload.episode || "").trim(),
+            sourceId,
+            episodeNumber: payload.episodeNumber || null,
+            episodeName: String(payload.episodeName || "").trim(),
+        }).then((added) => {
+            logInfo(added ? "已添加播放记录" : "播放记录已存在，跳过添加", {
+                vodId,
+                title,
+                episodeName: payload.episodeName || "",
+                episodeNumber: payload.episodeNumber || null,
+            });
+        }).catch((error) => {
+            logWarn("添加播放记录失败", { vodId, title, error: error.message || String(error) });
+        });
+    } catch (error) {
+        logWarn("添加播放记录异常", { vodId, title, error: error.message || String(error) });
     }
 }
 
@@ -2330,7 +2581,7 @@ async function getMergedMetadataCached(videoId, title, scrapeCandidates = []) {
                 file_name: item?.file_name || item?.name || "",
             })),
         });
-        await OmniBox.processScraping(String(videoId || ""), title || "", "", scrapeCandidates);
+        const scrapingResult = await OmniBox.processScraping(String(videoId || ""), title || "", title || "", scrapeCandidates);
         const metadata = await OmniBox.getScrapeMetadata(String(videoId || ""));
         const result = {
             scrapeData: metadata?.scrapeData || null,
@@ -2343,6 +2594,12 @@ async function getMergedMetadataCached(videoId, title, scrapeCandidates = []) {
             mappingCount: result.videoMappings.length,
             scrapeType: result.scrapeType || "",
             title: result.scrapeData?.title || "",
+            processResultKeys: scrapingResult && typeof scrapingResult === "object" ? Object.keys(scrapingResult).slice(0, 12) : [],
+            mappingPreview: result.videoMappings.slice(0, 3).map((item) => ({
+                fileId: String(item?.fileId || "").slice(0, 100),
+                episodeNumber: item?.episodeNumber || null,
+                episodeName: item?.episodeName || "",
+            })),
         });
         await setCachedJSON(cacheKey, result, QIWEI_CACHE_EX_SECONDS);
         return result;
@@ -2352,7 +2609,7 @@ async function getMergedMetadataCached(videoId, title, scrapeCandidates = []) {
     }
 }
 
-async function ensureDetailCache(videoId, video = {}) {
+async function ensureDetailCache(videoId, video = {}, options = {}) {
     const normalizedVideoId = String(videoId || video?.vod_id || "").trim();
     if (!normalizedVideoId) return null;
     const payload = await getCachedOrBuildVideoPanDetail({
@@ -2360,13 +2617,13 @@ async function ensureDetailCache(videoId, video = {}) {
         vod_name: video?.vod_name || "",
         vod_pic: video?.vod_pic || "",
         vod_remarks: video?.vod_remarks || "",
-    });
+    }, options);
     if (!payload) return null;
 
     return {
         cacheValue: payload,
         cacheKey: buildPanGroupDirectoryCacheKey(normalizedVideoId),
-        fromCache: true,
+        fromCache: options.forceRefresh === true ? false : true,
     };
 }
 
@@ -2643,57 +2900,237 @@ async function detail(params, context = {}) {
                 return { list: [] };
             }
             const rawEpisodes = Array.isArray(targetGroup?.episodes) ? targetGroup.episodes : [];
-            let normalizedEpisodes = rawEpisodes.map((ep, index) => ({
-                name: String(ep?.name || (sourceType === "magnet" ? `磁力资源${index + 1}` : `第${index + 1}集`)).trim(),
-                playId: String(ep?.playId || "").trim(),
-                _displayName: String(ep?._displayName || ep?.name || "").trim(),
-                _rawName: String(ep?._rawName || ep?.name || "").trim(),
-                _seedType: String(ep?._seedType || "").trim(),
-                _episodeNumber: Number.isFinite(ep?._episodeNumber) ? ep._episodeNumber : null,
-                _episodeRangeStart: Number.isFinite(ep?._episodeRangeStart) ? ep._episodeRangeStart : null,
-                _episodeRangeEnd: Number.isFinite(ep?._episodeRangeEnd) ? ep._episodeRangeEnd : null,
-            })).filter((ep) => ep.playId);
-            if (sourceType === "magnet") {
-                normalizedEpisodes = sortEpisodesByEpisodeNumber(normalizedEpisodes.map((ep) => ({
-                    ...ep,
-                    name: ep._displayName || ep.name,
-                    episodeNumber: ep._episodeNumber,
-                    episodeRangeStart: ep._episodeRangeStart,
-                    episodeRangeEnd: ep._episodeRangeEnd,
-                }))).map(({ episodeNumber, episodeRangeStart, episodeRangeEnd, _displayName, _rawName, _seedType, _episodeNumber, _episodeRangeStart, _episodeRangeEnd, ...rest }) => ({
-                    ...rest,
-                    _displayName,
-                    _rawName,
-                    _seedType,
-                    _episodeNumber: _episodeNumber ?? episodeNumber ?? null,
-                    _episodeRangeStart: _episodeRangeStart ?? episodeRangeStart ?? null,
-                    _episodeRangeEnd: _episodeRangeEnd ?? episodeRangeEnd ?? null,
-                }));
-            }
-            const fallbackSourceName = String(targetGroup?.name || (sourceType === "magnet" ? "磁力线路" : "采集线路")).trim();
-            const normalizedPlaySources = normalizedEpisodes.length > 0 ? [{
-                name: fallbackSourceName,
-                episodes: normalizedEpisodes.map((ep) => ({
-                    name: ep._displayName || ep.name,
-                    playId: ep.playId,
-                })),
-            }] : [];
-            const baseVodName = stripPanTypeSuffix(detailInfo.vod_name || video.vod_name || "七味资源");
-            return {
-                list: [{
-                    vod_id: rawVideoId,
-                    vod_name: baseVodName,
-                    vod_pic: detailInfo.vod_pic || video.vod_pic || "",
-                    vod_content: detailInfo.vod_content || "",
-                    vod_remarks: detailInfo.vod_remarks || fallbackSourceName,
-                    type_name: detailInfo.type_name || fallbackSourceName,
-                    vod_year: detailInfo.vod_year || "",
-                    vod_area: detailInfo.vod_area || "",
-                    vod_actor: detailInfo.vod_actor || "",
-                    vod_director: detailInfo.vod_director || "",
-                    vod_play_sources: normalizedPlaySources,
-                }],
+            const magnetEpisodeCount = rawEpisodes.filter((ep) => String(ep?.playId || "").trim().startsWith("magnet:")).length;
+            logInfo("磁力/采集线路详情分集统计", {
+                videoId,
+                sourceType,
+                lineIndex: parsed.lineIndex,
+                rawEpisodeCount: rawEpisodes.length,
+                magnetEpisodeCount,
+            });
+            const normalizeSourceEpisodes = (episodes, defaultPrefix) => {
+                let list = (Array.isArray(episodes) ? episodes : []).map((ep, index) => {
+                    const displayName = pickEpisodeDisplayName(ep, defaultPrefix, index);
+                    const rawName = normalizeText(ep?._rawName || ep?.fileName || ep?.file_name || ep?.name || displayName);
+                    return {
+                        name: displayName,
+                        playId: String(ep?.playId || "").trim(),
+                        _fid: String(ep?._fid || "").trim(),
+                        _displayName: displayName,
+                        _rawName: rawName || displayName,
+                        _seedType: String(ep?._seedType || "").trim(),
+                        _episodeNumber: Number.isFinite(ep?._episodeNumber) ? ep._episodeNumber : null,
+                        _episodeRangeStart: Number.isFinite(ep?._episodeRangeStart) ? ep._episodeRangeStart : null,
+                        _episodeRangeEnd: Number.isFinite(ep?._episodeRangeEnd) ? ep._episodeRangeEnd : null,
+                    };
+                }).filter((ep) => ep.playId);
+                if (sourceType === "magnet") {
+                    list = sortEpisodesByEpisodeNumber(list.map((ep) => ({
+                        ...ep,
+                        name: ep._displayName || ep.name,
+                        episodeNumber: ep._episodeNumber,
+                        episodeRangeStart: ep._episodeRangeStart,
+                        episodeRangeEnd: ep._episodeRangeEnd,
+                    }))).map(({ episodeNumber, episodeRangeStart, episodeRangeEnd, _displayName, _rawName, _seedType, _episodeNumber, _episodeRangeStart, _episodeRangeEnd, ...rest }) => ({
+                        ...rest,
+                        _displayName,
+                        _rawName,
+                        _seedType,
+                        _episodeNumber: _episodeNumber ?? episodeNumber ?? null,
+                        _episodeRangeStart: _episodeRangeStart ?? episodeRangeStart ?? null,
+                        _episodeRangeEnd: _episodeRangeEnd ?? episodeRangeEnd ?? null,
+                    }));
+                }
+                return list;
             };
+            const rawSourceName = String(targetGroup?.name || (sourceType === "magnet" ? "磁力" : "采集线路")).trim();
+            const normalizedPlaySources = [];
+            if (sourceType === "magnet") {
+                const convertedEpisodes = [];
+                const convertFailures = [];
+                logInfo("磁力线路开始同步秒传115", {
+                    videoId,
+                    lineIndex: parsed.lineIndex,
+                    has115Cookie: !!QIWEI_115_COOKIE,
+                    magnetEpisodeCount,
+                });
+                for (const ep of rawEpisodes) {
+                    const magnetPlayId = String(ep?.playId || "").trim();
+                    if (!magnetPlayId.startsWith("magnet:")) {
+                        convertFailures.push({ name: ep?.name || "", reason: "not_magnet_play_id" });
+                        continue;
+                    }
+                    const converted = await build115EpisodesFromMagnet(magnetPlayId, ep?.name || "115资源");
+                    if (converted?.episodes?.length) {
+                        convertedEpisodes.push(...converted.episodes.map((item, itemIndex) => ({
+                            ...item,
+                            _originName: ep?.name || "",
+                            _originDisplayName: ep?._displayName || ep?.name || "",
+                            _originIndex: itemIndex,
+                        })));
+                    } else {
+                        convertFailures.push({ name: ep?.name || "", reason: converted?.reason || converted?.state || "no_115_episodes" });
+                    }
+                }
+                const normalized115Episodes = normalizeSourceEpisodes(convertedEpisodes, "115资源");
+                if (normalized115Episodes.length > 0) {
+                    logInfo("磁力线路已秒传并生成115线路", {
+                        videoId,
+                        lineIndex: parsed.lineIndex,
+                        magnetEpisodeCount,
+                        episodeCount: normalized115Episodes.length,
+                        failureCount: convertFailures.length,
+                        episodeNamePreview: normalized115Episodes.slice(0, 3).map((ep) => ep._displayName || ep.name),
+                    });
+                    normalizedPlaySources.push({
+                        name: "115秒传",
+                        episodes: normalized115Episodes.map((ep, index) => {
+                            const episodeName = build115EpisodeDisplayName(ep, index);
+                            return {
+                                name: episodeName,
+                                episodeName,
+                                title: episodeName,
+                                playId: ep.playId,
+                                _fid: ep._fid,
+                                _rawName: ep._rawName || ep.fileName || episodeName,
+                                _episodeNumber: Number.isFinite(ep._episodeNumber) ? ep._episodeNumber : extractEpisodeNumber(ep._rawName || ep.fileName || episodeName),
+                            };
+                        }),
+                    });
+                } else {
+                    logWarn("磁力线路秒传115失败，仅返回原磁力线路", {
+                        videoId,
+                        lineIndex: parsed.lineIndex,
+                        magnetEpisodeCount,
+                        has115Cookie: !!QIWEI_115_COOKIE,
+                        failures: convertFailures.slice(0, 5),
+                    });
+                }
+            }
+            const normalizedMagnetEpisodes = normalizeSourceEpisodes(rawEpisodes, "磁力资源");
+            if (normalizedMagnetEpisodes.length > 0) {
+                normalizedPlaySources.push({
+                    name: sourceType === "magnet" ? "磁力" : rawSourceName,
+                    episodes: normalizedMagnetEpisodes.map((ep) => ({
+                        name: ep._displayName || ep.name,
+                        playId: ep.playId,
+                        _fid: ep._fid,
+                        _rawName: ep._rawName || ep.name,
+                    })),
+                });
+            }
+            const baseVodName = stripPanTypeSuffix(detailInfo.vod_name || video.vod_name || "七味资源");
+            const scrapeCandidates = [];
+            const seenSourceScrapeIds = new Set();
+            for (const source of normalizedPlaySources) {
+                for (const ep of source.episodes || []) {
+                    const fid = String(ep._fid || "").trim();
+                    const rawName = normalizeText(ep._rawName || ep.name || ep.episodeName || "");
+                    if (!fid || !rawName) continue;
+                    const key = `${fid}|${rawName}`;
+                    if (seenSourceScrapeIds.has(key)) continue;
+                    seenSourceScrapeIds.add(key);
+                    scrapeCandidates.push({
+                        fid,
+                        file_id: fid,
+                        file_name: rawName,
+                        name: rawName,
+                        format_type: "video",
+                    });
+                }
+            }
+            const { scrapeData, videoMappings, scrapeType } = await getMergedMetadataCached(videoId, baseVodName, scrapeCandidates);
+            const mappingPreview = (videoMappings || []).slice(0, 3).map((item) => `${String(item?.fileId || "").slice(0, 80)}=>${item?.episodeName || ""}`);
+            const mappingEpisodePreview = (videoMappings || []).slice(0, 5).map((item) => ({
+                fileId: String(item?.fileId || "").slice(0, 80),
+                seasonNumber: item?.seasonNumber || null,
+                episodeNumber: item?.episodeNumber || null,
+                episodeName: item?.episodeName || "",
+            }));
+            logInfo("磁力/采集线路刮削映射统计", {
+                videoId,
+                sourceType,
+                scrapeCandidateCount: scrapeCandidates.length,
+                mappingCount: Array.isArray(videoMappings) ? videoMappings.length : 0,
+                mappingPreview,
+                mappingEpisodePreview,
+                scrapeType,
+            });
+            for (const source of normalizedPlaySources) {
+                for (const ep of source.episodes || []) {
+                    const epNo = Number.isFinite(ep._episodeNumber) ? ep._episodeNumber : extractEpisodeNumber(ep._rawName || ep.name);
+                    const mapping = findScrapeMapping({ videoMappings }, [ep._fid], epNo, ep._rawName || ep.name);
+                    if (!mapping) {
+                        if (ep._fid) {
+                            logWarn("磁力/采集分集未命中刮削映射", {
+                                videoId,
+                                sourceName: source.name,
+                                fid: String(ep._fid || "").slice(0, 120),
+                                rawName: ep._rawName || ep.name,
+                                episodeNumber: epNo || null,
+                                mappingPreview,
+                                mappingEpisodePreview,
+                            });
+                        }
+                        continue;
+                    }
+                    const newName = buildScrapedEpisodeName(scrapeData, mapping, ep._rawName || ep.name, ep._displayName || ep.name);
+                    if (newName) {
+                        logInfo("磁力/采集分集应用刮削名", { sourceName: source.name, from: ep.name, to: newName, fid: String(ep._fid || "").slice(0, 120) });
+                        ep.name = newName;
+                        ep.episodeName = newName;
+                        ep.title = newName;
+                    }
+                    ep._seasonNumber = mapping.seasonNumber;
+                    ep._episodeNumber = mapping.episodeNumber;
+                    ep.playId = rewritePlayIdMeta(ep.playId, {
+                        sid: String(videoId || ""),
+                        fid: ep._fid,
+                        v: baseVodName,
+                        e: newName || ep.name,
+                        s: mapping.seasonNumber || "",
+                        n: mapping.episodeNumber || "",
+                    });
+                }
+            }
+            const fallbackSourceName = normalizedPlaySources[0]?.name || rawSourceName;
+            const legacyPlayFields = buildLegacyPlayFields(normalizedPlaySources);
+            logInfo("磁力/采集线路详情返回格式", {
+                videoId,
+                sourceType,
+                sourceCount: normalizedPlaySources.length,
+                sources: summarizePlaySourcesForLog(normalizedPlaySources),
+                legacyFrom: legacyPlayFields.vod_play_from,
+                legacyUrlLength: legacyPlayFields.vod_play_url.length,
+                legacyUrlPreview: legacyPlayFields.vod_play_url.slice(0, 500),
+            });
+            const vod = {
+                vod_id: rawVideoId,
+                vod_name: scrapeData?.title ? stripPanTypeSuffix(scrapeData.title) : baseVodName,
+                vod_pic: scrapeData?.posterPath ? `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}` : (detailInfo.vod_pic || video.vod_pic || ""),
+                vod_content: scrapeData?.overview || detailInfo.vod_content || "",
+                vod_remarks: detailInfo.vod_remarks || fallbackSourceName,
+                type_name: detailInfo.type_name || fallbackSourceName,
+                vod_year: scrapeData?.releaseDate ? String(scrapeData.releaseDate).substring(0, 4) : (detailInfo.vod_year || ""),
+                vod_area: detailInfo.vod_area || "",
+                vod_actor: detailInfo.vod_actor || "",
+                vod_director: detailInfo.vod_director || "",
+                vod_play_sources: normalizedPlaySources,
+                vod_play_from: legacyPlayFields.vod_play_from,
+                vod_play_url: legacyPlayFields.vod_play_url,
+            };
+            logInfo("磁力/采集线路详情最终输出", {
+                topKeys: ["list"],
+                listCount: 1,
+                vodKeys: Object.keys(vod),
+                vod_id: vod.vod_id,
+                vod_name: vod.vod_name,
+                vod_play_sources: summarizePlaySourcesForLog(vod.vod_play_sources),
+                vod_play_from: vod.vod_play_from,
+                vod_play_url_length: vod.vod_play_url.length,
+                vod_play_url_preview: vod.vod_play_url.slice(0, 800),
+            });
+            return { list: [vod] };
         }
 
         const links = Array.isArray(cachedDetail.grouped?.[targetPanType]) ? cachedDetail.grouped[targetPanType] : [];
@@ -2839,8 +3276,12 @@ async function detail(params, context = {}) {
 
         const normalizedPlaySources = sortPlaySourcesByDriveOrder(playSources).map((source) => ({
             name: source.name,
-            episodes: (source.episodes || []).map((ep) => ({ name: ep.name, playId: ep.playId })),
+            episodes: (source.episodes || []).map((ep, index) => {
+                const episodeName = pickEpisodeDisplayName(ep, "资源", index);
+                return { name: episodeName, episodeName, title: episodeName, playId: ep.playId };
+            }),
         }));
+        const legacyPlayFields = buildLegacyPlayFields(normalizedPlaySources);
 
         const baseVodName = stripPanTypeSuffix(detailInfo.vod_name || video.vod_name || "七味资源");
         const vod = {
@@ -2855,6 +3296,8 @@ async function detail(params, context = {}) {
             vod_actor: detailInfo.vod_actor || "",
             vod_director: detailInfo.vod_director || "",
             vod_play_sources: normalizedPlaySources,
+            vod_play_from: legacyPlayFields.vod_play_from,
+            vod_play_url: legacyPlayFields.vod_play_url,
         };
 
         if (scrapeData) {
@@ -2880,11 +3323,325 @@ async function detail(params, context = {}) {
             if (scrapeType && !vod.type_name) vod.type_name = scrapeType;
         }
 
+        logInfo("网盘分享详情最终输出", {
+            topKeys: ["list"],
+            listCount: 1,
+            vodKeys: Object.keys(vod),
+            vod_id: vod.vod_id,
+            vod_name: vod.vod_name,
+            vod_play_sources: summarizePlaySourcesForLog(vod.vod_play_sources),
+            vod_play_from: vod.vod_play_from,
+            vod_play_url_length: vod.vod_play_url.length,
+            vod_play_url_preview: vod.vod_play_url.slice(0, 800),
+        });
         return { list: [vod] };
     } catch (error) {
         logError("分组详情解析失败", error);
         return { list: [] };
     }
+}
+
+function normalize115OfflineFiles(files = []) {
+    return (Array.isArray(files) ? files : [])
+        .map((file, index) => ({
+            id: String(file?.id || file?.fid || file?.file_id || file?.pickcode || file?.pick_code || index).trim(),
+            name: String(file?.name || file?.file_name || file?.server_filename || `115文件${index + 1}`).trim(),
+            size: Number(file?.size || file?.file_size || 0) || 0,
+            pickcode: String(file?.pickcode || file?.pick_code || "").trim(),
+        }))
+        .filter((file) => file.id && file.name);
+}
+
+async function cache115MagnetResult(magnet, result) {
+    const normalizedMagnet = String(magnet || "").trim();
+    if (!normalizedMagnet || !result || !Array.isArray(result.files) || result.files.length === 0) return;
+    await setCachedJSON(build115MagnetCacheKey(normalizedMagnet), result, QIWEI_115_MAGNET_CACHE_EX_SECONDS);
+}
+
+async function pushMagnetTo115(magnet, options = {}) {
+    const cookie = QIWEI_115_COOKIE;
+    const normalizedMagnet = String(magnet || "").trim();
+    const useCache = options.useCache !== false;
+    const pollIntervalMs = Number(options.pollIntervalMs || 1500);
+    const pollMaxAttempts = Number(options.pollMaxAttempts || 4);
+    if (!cookie) {
+        logWarn("115秒传跳过: 未配置 QIWEI_115_COOKIE");
+        return { ok: false, state: "no_cookie", files: [], magnet: normalizedMagnet };
+    }
+    if (!normalizedMagnet.startsWith("magnet:")) {
+        logWarn("115秒传跳过: 无效磁力链接");
+        return { ok: false, state: "invalid_magnet", files: [], magnet: normalizedMagnet };
+    }
+    const cacheKey = build115MagnetCacheKey(normalizedMagnet);
+    if (useCache) {
+        const cached = await getCachedJSON(cacheKey);
+        if (cached && Array.isArray(cached.files) && cached.files.length > 0) {
+            logInfo("115秒传缓存命中", { magnet: normalizedMagnet.substring(0, 80), fileCount: cached.files.length });
+            return { ...cached, ok: true, state: cached.state || "cached", magnet: normalizedMagnet, cached: true };
+        }
+    }
+    try {
+        const uidMatch = cookie.match(/UID=(\d+)/);
+        const uid = uidMatch ? uidMatch[1] : "";
+        if (!uid) {
+            logWarn("115秒传失败: 无法从 cookie 提取 UID");
+            return { ok: false, state: "missing_uid", files: [], magnet: normalizedMagnet };
+        }
+        const commonHeaders = {
+            "User-Agent": DEFAULT_HEADERS["User-Agent"],
+            "Cookie": cookie,
+            "Origin": "https://115.com",
+            "Referer": "https://115.com/web/lixian/",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest"
+        };
+        const httpsAgent = new (require("https").Agent)({ rejectUnauthorized: false });
+        const spaceRes = await axios.get("https://115.com/?ct=offline&ac=space", {
+            headers: commonHeaders,
+            timeout: 10000,
+            httpsAgent
+        });
+        const spaceJson = spaceRes.data;
+        if (!spaceJson.state) {
+            logWarn("115秒传失败: 获取签名失败", spaceJson);
+            return { ok: false, state: "space_failed", files: [], magnet: normalizedMagnet, raw: spaceJson };
+        }
+        const sign = spaceJson.sign;
+        const reqTime = spaceJson.time;
+        if (!sign || !reqTime) {
+            logWarn("115秒传失败: 签名数据不完整");
+            return { ok: false, state: "space_invalid", files: [], magnet: normalizedMagnet, raw: spaceJson };
+        }
+        const addTask = async () => {
+            const addRes = await axios.post("https://115.com/web/lixian/?ct=lixian&ac=add_task_url",
+                `url=${encodeURIComponent(normalizedMagnet)}&uid=${uid}&sign=${sign}&time=${reqTime}`,
+                {
+                    headers: {
+                        ...commonHeaders,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    },
+                    timeout: 15000,
+                    httpsAgent
+                }
+            );
+            return addRes.data || {};
+        };
+        const pollTaskUntilFiles = async (firstJson) => {
+            let currentJson = firstJson || {};
+            for (let attempt = 0; attempt < pollMaxAttempts; attempt++) {
+                const currentFiles = normalize115OfflineFiles(currentJson?.files || []);
+                if (currentFiles.length > 0) return { json: currentJson, files: currentFiles, attempts: attempt };
+                await sleep(pollIntervalMs);
+                currentJson = await addTask();
+                const nextFiles = normalize115OfflineFiles(currentJson?.files || []);
+                if (nextFiles.length > 0) return { json: currentJson, files: nextFiles, attempts: attempt + 1 };
+                if (currentJson?.errcode === 10008) return { json: currentJson, files: nextFiles, attempts: attempt + 1 };
+            }
+            return { json: currentJson, files: normalize115OfflineFiles(currentJson?.files || []), attempts: pollMaxAttempts };
+        };
+        const addJson = await addTask();
+        let files = normalize115OfflineFiles(addJson?.files || []);
+        let finalJson = addJson;
+        let pollAttempts = 0;
+        if ((addJson.state || addJson.errcode === 0 || addJson.errcode === 10008) && files.length === 0) {
+            const polled = await pollTaskUntilFiles(addJson);
+            finalJson = polled.json || addJson;
+            files = polled.files || [];
+            pollAttempts = polled.attempts || 0;
+        }
+        if (finalJson.state || finalJson.errcode === 0 || finalJson.errcode === 10008) {
+            const result = {
+                ok: true,
+                state: finalJson.errcode === 10008 ? "exists" : (files.length > 0 ? "submitted" : "submitted_waiting"),
+                magnet: normalizedMagnet,
+                infoHash: String(finalJson.info_hash || "").trim(),
+                files,
+                raw: finalJson,
+            };
+            logInfo(finalJson.errcode === 10008 ? "115任务已存在" : (files.length > 0 ? "115秒传成功" : "115秒传提交后轮询中"), {
+                magnet: normalizedMagnet.substring(0, 80),
+                fileCount: files.length,
+                attempts: pollAttempts,
+            });
+            if (files.length > 0) await cache115MagnetResult(normalizedMagnet, result);
+            return result;
+        }
+        logWarn("115秒传失败", finalJson);
+        return { ok: false, state: "add_failed", files, magnet: normalizedMagnet, raw: finalJson };
+    } catch (error) {
+        logError("115秒传异常", error);
+        return { ok: false, state: "exception", files: [], magnet: normalizedMagnet, error: error.message || String(error) };
+    }
+}
+
+async function build115EpisodesFromMagnet(magnet, baseName = "115资源") {
+    const result = await pushMagnetTo115(magnet);
+    if (!result?.ok) {
+        logWarn("115秒传未生成剧集", {
+            magnet: String(magnet || "").slice(0, 100),
+            state: result?.state || "unknown",
+            error: result?.error || "",
+            fileCount: Array.isArray(result?.files) ? result.files.length : 0,
+        });
+        return { episodes: [], reason: result?.state || "push_failed", state: result?.state || "" };
+    }
+    if (!Array.isArray(result.files) || result.files.length === 0) {
+        logWarn("115秒传成功但未返回文件列表", {
+            magnet: String(magnet || "").slice(0, 100),
+            state: result?.state || "",
+            rawKeys: result?.raw && typeof result.raw === "object" ? Object.keys(result.raw).slice(0, 12) : [],
+        });
+        return { episodes: [], reason: "empty_files", state: result?.state || "" };
+    }
+    const episodes = result.files.map((file, index) => {
+        const rawName = cleanPlayLabel(file.name, `${baseName}${index + 1}`);
+        const formattedName = file.size > 0 ? `[${formatFileSize(file.size)}] ${rawName}` : rawName;
+        const episodeRange = extractEpisodeRange(rawName);
+        const episodeNumber = episodeRange ? null : extractEpisodeNumber(rawName);
+        const shortName = build115ButtonName(index);
+        const displayName = cleanPlayLabel(formattedName, rawName || shortName);
+        const playMeta = encodeMeta({ type: "115_magnet", magnet, fileName: rawName, fileId: file.id, pickcode: file.pickcode });
+        return {
+            name: shortName,
+            title: shortName,
+            episodeName: shortName,
+            playId: build115MagnetPlayId({ magnet, fileName: rawName, fileId: file.id, pickcode: file.pickcode }),
+            _fid: `115magnet:${result.infoHash || crypto.createHash("sha1").update(String(magnet || "")).digest("hex")}:${file.id}`,
+            _rawName: rawName,
+            _displayName: displayName,
+            _seedType: "115",
+            _episodeNumber: episodeNumber,
+            _episodeRangeStart: episodeRange?.start ?? null,
+            _episodeRangeEnd: episodeRange?.end ?? null,
+            fileName: rawName,
+        };
+    });
+    logInfo("115秒传文件分集生成完成", {
+        magnet: String(magnet || "").slice(0, 100),
+        episodeCount: episodes.length,
+        episodeNamePreview: episodes.slice(0, 3).map((ep) => ep._displayName || ep.name),
+    });
+    return { name: "115网盘", episodes, result };
+}
+
+function build115Headers() {
+    return {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Cookie": QIWEI_115_COOKIE,
+        "Origin": "https://115.com",
+        "Referer": "https://115.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    };
+}
+
+function same115FileName(a = "", b = "") {
+    const basename = (value) => String(value || "").split(/[\\/]/).pop().trim();
+    return basename(a) && basename(a) === basename(b);
+}
+
+async function find115FileByName(fileName = "") {
+    const targetName = String(fileName || "").trim();
+    if (!targetName || !QIWEI_115_COOKIE) return null;
+    const key = buildCacheKey("qiwei-group:115-file", targetName);
+    const cached = await getCachedJSON(key);
+    if (cached?.fid || cached?.pickcode) {
+        logInfo("115文件搜索缓存命中", { fileName: targetName, fid: cached.fid || "", pickcode: cached.pickcode || "" });
+        return cached;
+    }
+
+    const keyword = targetName.split(/[\\/]/).pop().replace(/\.[a-z0-9]{2,5}$/i, "").slice(0, 80);
+    const url = `https://webapi.115.com/files/search?search_value=${encodeURIComponent(keyword)}&format=json&type=4&limit=50`;
+    const res = await axios.get(url, {
+        headers: build115Headers(),
+        timeout: 10000,
+        httpsAgent: new (require("https").Agent)({ rejectUnauthorized: false }),
+    });
+    const json = res.data || {};
+    const list = Array.isArray(json?.data) ? json.data : (Array.isArray(json?.data?.list) ? json.data.list : (Array.isArray(json?.files) ? json.files : []));
+    const normalized = list.map((item) => ({
+        fid: String(item.fid || item.file_id || item.id || item.cid || "").trim(),
+        name: String(item.n || item.name || item.file_name || item.server_filename || "").trim(),
+        pickcode: String(item.pc || item.pickcode || item.pick_code || "").trim(),
+        size: Number(item.s || item.size || item.file_size || 0) || 0,
+    })).filter((item) => item.name && (item.fid || item.pickcode));
+    const matched = normalized.find((item) => same115FileName(item.name, targetName)) || normalized[0] || null;
+    logInfo("115文件搜索结果", { keyword, targetName, resultCount: normalized.length, matched: matched?.name || "" });
+    if (matched) await setCachedJSON(key, matched, QIWEI_115_MAGNET_CACHE_EX_SECONDS);
+    return matched;
+}
+
+async function get115VideoPlayUrl(file) {
+    const pickcode = String(file?.pickcode || file?.pc || "").trim();
+    if (!pickcode) throw new Error("115真实文件缺少 pickcode，无法解析播放地址");
+    const headers = build115Headers();
+    const urls = [
+        `https://115.com/api/video/m3u8/${encodeURIComponent(pickcode)}.m3u8`,
+        `https://webapi.115.com/files/video?pickcode=${encodeURIComponent(pickcode)}`,
+    ];
+    let lastError = null;
+    for (const url of urls) {
+        try {
+            const res = await axios.get(url, {
+                headers,
+                timeout: 10000,
+                maxRedirects: 0,
+                validateStatus: (status) => status >= 200 && status < 400,
+                httpsAgent: new (require("https").Agent)({ rejectUnauthorized: false }),
+            });
+            const location = res.headers?.location || "";
+            if (location) return location;
+            if (typeof res.data === "string" && res.data.includes("#EXTM3U")) return url;
+            const data = res.data || {};
+            const candidate = data?.data?.video_url || data?.data?.url || data?.video_url || data?.url || data?.data?.m3u8 || data?.m3u8 || "";
+            if (candidate) return candidate;
+        } catch (error) {
+            lastError = error;
+            logWarn("115视频地址解析尝试失败", { pickcode, url, error: error.message || String(error) });
+        }
+    }
+    throw lastError || new Error("115未返回可播放地址");
+}
+
+async function resolve115MagnetPlay(playId, flag, callerSource, context) {
+    const data = typeof playId === "object" && playId
+        ? playId
+        : decode115MagnetPlayMeta(playId);
+    const magnet = String(data.magnet || "").trim();
+    const targetFileId = String(data.fileId || "").trim();
+    const result = await pushMagnetTo115(magnet);
+    const targetFile = (result.files || []).find((file) => String(file.id) === targetFileId) || (result.files || [])[0];
+    if (!targetFile?.name) throw new Error("115秒传缓存未找到目标文件名");
+
+    const realFile = await find115FileByName(targetFile.name);
+    if (!realFile) throw new Error("115网盘内未搜索到真实文件");
+    const playUrl = await get115VideoPlayUrl(realFile);
+    const playResult = {
+        urls: [{ name: "115播放", url: playUrl }],
+        flag: "115网盘",
+        header: {
+            "User-Agent": DEFAULT_HEADERS["User-Agent"],
+            "Referer": "https://115.com/",
+            "Cookie": QIWEI_115_COOKIE,
+        },
+        parse: 0,
+        danmaku: [],
+    };
+    addPlayHistoryAsync({
+        sourceId: context?.sourceId || "七味分组-115秒传",
+        vodId: magnet || targetFileId || realFile.fid || playUrl,
+        title: String(data.vodName || data.title || data.fileName || targetFile.name || "115秒传资源").trim(),
+        pic: "",
+        episode: realFile.name || targetFile.name || "",
+        episodeName: realFile.name || targetFile.name || "",
+    });
+    logInfo("115磁力文件播放地址返回", {
+        fid: realFile.fid || "",
+        pickcode: realFile.pickcode || "",
+        fileName: realFile.name || targetFile.name,
+        output: summarizePlayResultForLog(playResult),
+    });
+    return playResult;
 }
 
 async function play(params, context = {}) {
@@ -2913,9 +3670,38 @@ async function play(params, context = {}) {
         logInfo("解析透传信息", { sid: playMeta.sid || "", fid: playMeta.fid || "", e: playMeta.e || "" });
     }
 
+    if (is115MagnetPlayId(playId, flag)) {
+        const magnetMeta = decode115MagnetPlayMeta(playId);
+        try {
+            logInfo("识别为115秒传播放，直接走115网盘解析", {
+                flag,
+                hasPrefix: playId.startsWith("115magnet:"),
+                kind: magnetMeta.kind || "",
+                fileName: magnetMeta.fileName || "",
+                fileId: magnetMeta.fileId || "",
+            });
+            return await resolve115MagnetPlay(playId, flag, callerSource, context);
+        } catch (error) {
+            logWarn("115磁力播放失败，回退磁力", { error: error.message || String(error), fileName: magnetMeta.fileName || playMeta.fileName || "" });
+            if (magnetMeta.magnet) playId = magnetMeta.magnet;
+            else if (playMeta.magnet) playId = playMeta.magnet;
+            else throw error;
+        }
+    }
+
     if (playId.startsWith("magnet:")) {
+        const pushed = await pushMagnetTo115(playId);
+        const displayName = pushed?.ok ? "磁力资源（已提交115）" : "磁力资源";
+        addPlayHistoryAsync({
+            sourceId: context?.sourceId || "七味分组-磁力",
+            vodId: String(params.vodId || playMeta.sid || playId).trim(),
+            title: String(params.vodName || playMeta.v || playMeta.e || displayName).trim(),
+            episode: String(params.episodeName || playMeta.e || displayName).trim(),
+            episodeName: String(params.episodeName || playMeta.e || displayName).trim(),
+            episodeNumber: playMeta.n || null,
+        });
         return {
-            urls: [{ name: "磁力资源", url: playId }],
+            urls: [{ name: displayName, url: playId }],
             parse: 0,
             header: {
                 ...DEFAULT_HEADERS,
@@ -3018,6 +3804,15 @@ async function play(params, context = {}) {
                     const metadataValue = metadataResult.status === "fulfilled" ? metadataResult.value : null;
                     const finalDanmaku = metadataValue?.danmakuList?.length ? metadataValue.danmakuList : (playInfo?.danmaku || []);
 
+                    addPlayHistoryAsync({
+                        sourceId: context?.sourceId || `七味分组-${parsePanType(shareURL) || "网盘"}`,
+                        vodId: String(params.vodId || playMeta.sid || shareURL).trim(),
+                        title: String(metadataValue?.scrapeTitle || params.vodName || playMeta.v || playMeta.e || "网盘资源").trim(),
+                        pic: metadataValue?.scrapePic || "",
+                        episode: String(metadataValue?.episodeName || params.episodeName || playMeta.e || fileId).trim(),
+                        episodeName: String(metadataValue?.episodeName || params.episodeName || playMeta.e || fileId).trim(),
+                        episodeNumber: metadataValue?.episodeNumber || playMeta.n || null,
+                    });
                     return {
                         urls: urlsResult,
                         flag: shareURL,
@@ -3126,6 +3921,15 @@ async function play(params, context = {}) {
                 }
             }
 
+            addPlayHistoryAsync({
+                sourceId: context?.sourceId || `七味分组-${flag || "采集"}`,
+                vodId: String(params.vodId || playMeta.sid || playId).trim(),
+                title: String(vodName || params.vodName || playMeta.v || playMeta.e || "七味资源").trim(),
+                pic: "",
+                episode: String(episodeName || params.episodeName || playMeta.e || "").trim(),
+                episodeName: String(episodeName || params.episodeName || playMeta.e || "").trim(),
+                episodeNumber: playMeta.n || null,
+            });
             return {
                 urls: [{ name: "嗅探线路", url: sniffed.url }],
                 parse: 0,
