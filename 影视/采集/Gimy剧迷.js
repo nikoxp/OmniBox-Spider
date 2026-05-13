@@ -2,7 +2,7 @@
 // @author 梦
 // @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放页嗅探
 // @dependencies cheerio,@types/opencc-js
-// @version 1.2.1
+// @version 1.2.4
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
@@ -11,6 +11,7 @@ const cheerio = require("cheerio");
 
 const BASE_URL = "https://gimyai.tw";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+const DEFAULT_PLAY_SOURCE_ORDER = ["4K画质线路 ᴴᴰ", "超清线路 ᴴᴰ"];
 
 let simplifyConverter = null;
 let simplifyConverterName = "fallback-map";
@@ -212,6 +213,55 @@ function toDisplayText(value) {
   return convertTraditionalToSimplified(normalizeText(value));
 }
 
+function parsePlaySourceOrderConfig() {
+  const raw = String(process.env.GIMY_PLAY_SOURCE_ORDER || process.env.GIMY_SOURCE_ORDER || "").trim();
+  if (!raw) return DEFAULT_PLAY_SOURCE_ORDER;
+
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map((item) => String(item || "").trim()).filter(Boolean);
+    } catch (_) {}
+  }
+
+  return raw.split(/[,\n|;]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizePlaySourceKey(value) {
+  return toDisplayText(value)
+    .replace(/[ᴴＨｈ]/g, "H")
+    .replace(/[ᴰＤｄ]/g, "D")
+    .replace(/\s+/g, "")
+    .replace(/HD$/i, "")
+    .toLowerCase();
+}
+
+function getPlaySourceOrderMap() {
+  const orderMap = new Map();
+  parsePlaySourceOrderConfig().forEach((name, index) => {
+    const key = normalizePlaySourceKey(name);
+    if (key && !orderMap.has(key)) orderMap.set(key, index);
+  });
+  return orderMap;
+}
+
+function sortPlaySources(playSources) {
+  const orderMap = getPlaySourceOrderMap();
+  if (!orderMap.size) return playSources;
+
+  return playSources
+    .map((source, index) => ({ source, index, order: orderMap.get(normalizePlaySourceKey(source.name)) }))
+    .sort((a, b) => {
+      const aConfigured = Number.isInteger(a.order);
+      const bConfigured = Number.isInteger(b.order);
+      if (aConfigured && bConfigured) return a.order - b.order || a.index - b.index;
+      if (aConfigured) return -1;
+      if (bConfigured) return 1;
+      return a.index - b.index;
+    })
+    .map((item) => item.source);
+}
+
 function normalizeSearchKeyword(value) {
   return convertTraditionalToSimplified(String(value || ""))
     .replace(/[\s\-_—–·•:：,，.。!?！？'"“”‘’()（）\[\]【】{}]/g, "")
@@ -364,29 +414,45 @@ async function category(params, context) {
   }
 }
 
+function collectPlaylistEpisodes($, scope) {
+  const episodes = [];
+  const seen = new Set();
+  $(scope).find("a[href*='/play/']").each((_, a) => {
+    const $a = $(a);
+    const href = $a.attr("href") || "";
+    const playId = absUrl(href);
+    if (!playId || seen.has(playId)) return;
+    const epName = toDisplayText($a.text()) || "正片";
+    seen.add(playId);
+    episodes.push({ name: epName, playId });
+  });
+  return episodes;
+}
+
 function parsePlaySources($) {
   const tabs = [];
+  const seenTabs = new Set();
   $("#playTab a[href^='#con_playlist_']").each((_, el) => {
     const $el = $(el);
     const href = $el.attr("href") || "";
     const tabId = href.replace(/^#/, "");
     const name = toDisplayText($el.text()) || tabId;
-    if (tabId) tabs.push({ tabId, name });
+    if (tabId && !seenTabs.has(tabId)) {
+      seenTabs.add(tabId);
+      tabs.push({ tabId, name });
+    }
   });
 
   const playSources = [];
   for (const tab of tabs) {
-    const episodes = [];
-    $(`#${tab.tabId} a[href*='/play/']`).each((_, a) => {
-      const $a = $(a);
-      const href = $a.attr("href") || "";
-      const epName = toDisplayText($a.text()) || "正片";
-      if (!href) return;
-      episodes.push({ name: epName, playId: absUrl(href) });
+    let episodes = [];
+    $("[id]").filter((_, el) => String($(el).attr("id") || "") === tab.tabId).each((_, playlist) => {
+      const candidate = collectPlaylistEpisodes($, playlist);
+      if (candidate.length > episodes.length) episodes = candidate;
     });
     if (episodes.length) playSources.push({ name: tab.name, episodes });
   }
-  return playSources;
+  return sortPlaySources(playSources);
 }
 
 function pickInfo(html, label) {
