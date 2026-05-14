@@ -1,7 +1,7 @@
 // @name 金牌
 // @author 梦
 // @description API 站：https://m.jiabaide.cn，支持首页、分类、搜索、详情与播放解析
-// @version 1.1.2
+// @version 1.1.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/金牌.js
 // @dependencies crypto-js
 
@@ -182,6 +182,38 @@ function buildMappingPreview(mappings = [], limit = 5) {
     .join("; ");
 }
 
+function pickEpisodeNumber(...values) {
+  for (const value of values) {
+    if (Number.isFinite(value) && value > 0) return value;
+    const raw = text(value);
+    if (!raw) continue;
+    const direct = Number(raw);
+    if (Number.isFinite(direct) && direct > 0) return direct;
+    const match = raw.match(/^(?:第\s*)?(\d+)\s*(?:集|话|期)?(?:[\s.、:_-].*)?$/);
+    if (match) {
+      const parsed = Number(match[1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  return null;
+}
+
+function formatEpisodeDisplayName(name = "", episodeNumber = null) {
+  const rawName = text(name);
+  const prefixed = rawName.match(/^(?:第\s*(\d+)\s*(?:集|话|期)\s*|(\d+)\s*[.、:_-]\s*)(.*)$/);
+  const prefixedNumber = prefixed ? Number(prefixed[1] || prefixed[2]) : null;
+  const finalNumber = Number.isFinite(episodeNumber) && episodeNumber > 0 ? episodeNumber : prefixedNumber;
+  const episodeName = prefixed ? text(prefixed[3]) : rawName;
+
+  if (!finalNumber) {
+    return episodeName;
+  }
+  if (!episodeName) {
+    return `第${finalNumber}集`;
+  }
+  return `第${finalNumber}集 ${episodeName}`;
+}
+
 function summarizeScrapeCandidates(candidates = [], limit = 5) {
   if (!Array.isArray(candidates) || candidates.length === 0) return "";
   return candidates
@@ -346,10 +378,11 @@ async function detail(params, context) {
 
     const mappings = Array.isArray(scrapeMetadata?.videoMappings) ? scrapeMetadata.videoMappings : [];
     await OmniBox.log("info", `[金牌][detail] mappingPreview kid=${kid} preview=${buildMappingPreview(mappings) || "<empty>"}`);
-    const episodes = rawEpisodeList.map((it) => {
+    const episodes = rawEpisodeList.map((it, index) => {
       const nid = text(it.nid);
       const mapping = findEpisodeMapping(mappings, [nid]);
-      const episodeName = text(mapping?.episodeName || it.name || `第${nid || "1"}集`);
+      const episodeNumber = pickEpisodeNumber(mapping?.episodeNumber, it.episodeNumber, it.name, index + 1);
+      const episodeName = formatEpisodeDisplayName(mapping?.episodeName || it.name || `第${episodeNumber || nid || "1"}集`, episodeNumber);
       return {
         name: episodeName,
         playId: buildEpisodePlayId({
@@ -494,14 +527,16 @@ async function play(params, context) {
     }
 
     const header = { "User-Agent": MOBILE_UA };
+    const historyEpisodeNumber = pickEpisodeNumber(mapping?.episodeNumber, episodeName);
+    const historyEpisodeName = formatEpisodeDisplayName(mapping?.episodeName || episodeName, historyEpisodeNumber);
     const historyPayload = {
       vodId: sid,
       title: scrapeTitle || title || sid,
       pic: scrapePic || undefined,
       episode: rawPlayId,
       sourceId: context?.sourceId,
-      episodeNumber: Number.isFinite(mapping?.episodeNumber) ? mapping.episodeNumber : undefined,
-      episodeName: text(mapping?.episodeName || episodeName || undefined),
+      episodeNumber: historyEpisodeNumber || undefined,
+      episodeName: text(historyEpisodeName || undefined),
       playUrl: urls[0]?.url || "",
       playHeader: header,
     };

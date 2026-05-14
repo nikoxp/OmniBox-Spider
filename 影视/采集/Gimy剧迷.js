@@ -2,16 +2,29 @@
 // @author 梦
 // @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放页嗅探
 // @dependencies cheerio,@types/opencc-js
-// @version 1.2.4
+// @version 1.2.5
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
 const cheerio = require("cheerio");
 
+// ==================== 配置开始 ====================
+// 是否禁用 OpenCC 等外部繁简转换库；环境变量 GIMY_DISABLE_OPENCC=1 时仅使用内置兜底映射。
+const DISABLE_OPENCC = String(process.env.GIMY_DISABLE_OPENCC || "").trim() === "1";
+
+// 播放线路排序环境配置；优先读取 GIMY_PLAY_SOURCE_ORDER，GIMY_SOURCE_ORDER 作为兼容别名。
+const PLAY_SOURCE_ORDER_CONFIG = String(process.env.GIMY_PLAY_SOURCE_ORDER || process.env.GIMY_SOURCE_ORDER || "").trim();
+
+// 站点基础地址，用于补全相对链接和发起默认请求。
 const BASE_URL = "https://gimyai.tw";
+
+// 请求使用的 User-Agent，避免站点返回移动端或拦截页面。
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+
+// 未设置播放线路排序环境变量时的默认优先线路，未命中的线路保持站点原始顺序。
 const DEFAULT_PLAY_SOURCE_ORDER = ["4K画质线路 ᴴᴰ", "超清线路 ᴴᴰ"];
+// ==================== 配置结束 ====================
 
 let simplifyConverter = null;
 let simplifyConverterName = "fallback-map";
@@ -131,7 +144,7 @@ function getSimplifyConverter() {
   if (simplifyConverterChecked) return simplifyConverter;
   simplifyConverterChecked = true;
 
-  if (String(process.env.GIMY_DISABLE_OPENCC || "").trim() === "1") {
+  if (DISABLE_OPENCC) {
     simplifyConverterName = "fallback-map";
     simplifyConverter = fallbackTraditionalToSimplified;
     return simplifyConverter;
@@ -214,7 +227,7 @@ function toDisplayText(value) {
 }
 
 function parsePlaySourceOrderConfig() {
-  const raw = String(process.env.GIMY_PLAY_SOURCE_ORDER || process.env.GIMY_SOURCE_ORDER || "").trim();
+  const raw = PLAY_SOURCE_ORDER_CONFIG;
   if (!raw) return DEFAULT_PLAY_SOURCE_ORDER;
 
   if (raw.startsWith("[")) {
