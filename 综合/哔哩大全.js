@@ -1,14 +1,15 @@
 // @name 哔哩大全
 // @author 
 // @description 弹幕：支持
-// @dependencies: axios
-// @version 1.1.0
+// @dependencies: axios, crypto
+// @version 1.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/综合/哔哩大全.js
 
 /**
  * 哔哩大全 - OmniBox 爬虫脚本（模板化版本）
  */
 const axios = require("axios");
+const crypto = require("crypto");
 const OmniBox = require("omnibox_sdk");
 
 // ==================== 配置区域 ====================
@@ -19,10 +20,102 @@ const BILI_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   Referer: "https://www.bilibili.com",
+  Origin: "https://www.bilibili.com",
+  "Sec-Fetch-Site": "same-site",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Dest": "empty",
   ...(BILI_COOKIE ? { Cookie: BILI_COOKIE } : {}),
 };
 
 const isLoggedIn = () => Boolean(BILI_COOKIE && BILI_COOKIE.includes("SESSDATA="));
+
+const MIXIN_KEY_ENC_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+  27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 17, 6, 28,
+];
+
+function getMixinKey(raw) {
+  return MIXIN_KEY_ENC_TAB.map((n) => raw[n]).join("").substring(0, 32);
+}
+
+let _wbiKeysCache = null;
+let _searchHeadersCache = null;
+
+function generateBuvid3() {
+  const now = Date.now();
+  const rand = Math.random().toString(16).substring(2, 10);
+  const ts = now.toString(16);
+  return `${ts}${rand}`;
+}
+
+function generateBuvid4() {
+  const now = Date.now();
+  const rand = Math.random().toString(16).substring(2, 14);
+  const ts = now.toString(16);
+  return `X${ts}${rand}`;
+}
+
+async function initSearchHeaders() {
+  if (_searchHeadersCache) return _searchHeadersCache;
+  let cookie = BILI_COOKIE || "";
+  if (!cookie.includes("buvid3")) {
+    cookie += `${cookie ? "; " : ""}buvid3=${generateBuvid3()}`;
+  }
+  if (!cookie.includes("buvid4")) {
+    cookie += `; buvid4=${generateBuvid4()}`;
+  }
+  _searchHeadersCache = {
+    "User-Agent": BILI_HEADERS["User-Agent"],
+    Referer: "https://search.bilibili.com/all?keyword=1",
+    Origin: "https://search.bilibili.com",
+    Cookie: cookie,
+  };
+  return _searchHeadersCache;
+}
+
+async function getWbiKeys() {
+  if (_wbiKeysCache) return _wbiKeysCache;
+  try {
+    const navHeaders = await initSearchHeaders();
+    const { data } = await axios.get("https://api.bilibili.com/x/web-interface/nav", {
+      headers: navHeaders,
+    });
+    logInfo(`nav接口 code: ${data?.code}, message: ${data?.message}`);
+    const { wbi_img: { img_url, sub_url } = {} } = data?.data || {};
+    const imgKey = (img_url || "").split("/").pop().split(".")[0] || "";
+    const subKey = (sub_url || "").split("/").pop().split(".")[0] || "";
+    logInfo(`获取WbiKeys imgKey: ${imgKey}, subKey: ${subKey}`);
+    if (!imgKey || !subKey) {
+      logInfo(`nav data.data keys: ${JSON.stringify(data?.data ? Object.keys(data.data) : []).substring(0, 300)}`);
+      logInfo(`wbi_img: ${JSON.stringify(data?.data?.wbi_img).substring(0, 300)}`);
+    }
+    _wbiKeysCache = { imgKey, subKey };
+    return _wbiKeysCache;
+  } catch (err) {
+    logError("获取WbiKeys失败", err);
+    return { imgKey: "", subKey: "" };
+  }
+}
+
+async function signWbiParams(params) {
+  const { imgKey, subKey } = await getWbiKeys();
+  const mixinKey = getMixinKey(imgKey + subKey);
+  const wts = Math.floor(Date.now() / 1000);
+  const sortedParams = Object.keys(params)
+    .sort()
+    .reduce((obj, key) => {
+      if (params[key] !== undefined && params[key] !== null) {
+        obj[key] = params[key];
+      }
+      return obj;
+    }, {});
+  sortedParams.wts = wts;
+  const query = Object.entries(sortedParams)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+  const w_rid = crypto.createHash("md5").update(query + mixinKey).digest("hex");
+  return { ...sortedParams, w_rid };
+}
 
 const CLASSES = [
   { type_id: "沙雕仙逆", type_name: "傻屌仙逆" },
@@ -264,14 +357,24 @@ async function category(params) {
   }
 
   try {
+    const rawParams = {
+      search_type: "video",
+      keyword,
+      page,
+    };
+    const signedParams = await signWbiParams(rawParams);
+    logInfo(`签名参数: ${JSON.stringify(signedParams)}`);
+    const searchHeaders = await initSearchHeaders();
+    logInfo(`搜索Cookie(含buvid): ${searchHeaders.Cookie?.substring(0, 120)}`);
     const { data } = await axios.get("https://api.bilibili.com/x/web-interface/search/type", {
-      headers: BILI_HEADERS,
-      params: {
-        search_type: "video",
-        keyword,
-        page,
-      },
+      headers: searchHeaders,
+      params: signedParams,
     });
+    logInfo(`搜索响应 code: ${data?.code}, message: ${data?.message}`);
+    logInfo(`搜索结果数量: ${(data?.data?.result || []).length}, numResults: ${data?.data?.numResults}`);
+    if (data?.code !== 0) {
+      logInfo(`搜索响应完整: ${JSON.stringify(data).substring(0, 500)}`);
+    }
 
     const list = (data?.data?.result || [])
       .filter((item) => item.type === "video")
